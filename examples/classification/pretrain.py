@@ -4,19 +4,51 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch import distributed as dist
+# tensorboard==2.8 expects np.bool8 which is removed in numpy>=2
+if not hasattr(np, "bool8"):
+    np.bool8 = np.bool_
 from torch.utils.tensorboard import SummaryWriter
 
 from openpoints.utils import setup_logger_dist, Wandb
 from openpoints.utils import AverageMeter, resume_model, load_checkpoint, save_checkpoint, \
     cal_model_parm_nums, set_random_seed
-from openpoints.dataset import build_dataloader_from_cfg
 from openpoints.optim import build_optimizer_from_cfg
 from openpoints.scheduler import build_scheduler_from_cfg
 from openpoints.models import build_model_from_cfg
-from openpoints.models.layers import furthest_point_sample, fps
+try:
+    from openpoints.models.layers import furthest_point_sample, fps
+except Exception:
+    furthest_point_sample = None
+    fps = None
+
+
+def _get_device(rank):
+    if torch.cuda.is_available():
+        ngpu = max(1, torch.cuda.device_count())
+        return torch.device(f"cuda:{rank % ngpu}")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _move_batch_to_device(data, device):
+    non_blocking = device.type == "cuda"
+    for key in data.keys():
+        data[key] = data[key].to(device, non_blocking=non_blocking)
+    return data
+
+
+def _random_resample_points(points, npoints):
+    bsz, ncurr, channels = points.shape
+    idx = torch.randint(ncurr, (bsz, npoints), device=points.device)
+    return torch.gather(points, 1, idx.unsqueeze(-1).expand(-1, -1, channels))
 
 
 def main(gpu, cfg, profile=False):
+    device = _get_device(cfg.rank)
+    cfg.device = str(device)
+    if cfg.distributed and (not torch.cuda.is_available()) and cfg.dist_backend == 'nccl':
+        cfg.dist_backend = 'gloo'
     if cfg.distributed:
         if cfg.mp:
             cfg.rank = gpu
@@ -39,7 +71,7 @@ def main(gpu, cfg, profile=False):
     logger.info(cfg)
 
     # build model
-    model = build_model_from_cfg(cfg.model).to(cfg.rank)
+    model = build_model_from_cfg(cfg.model).to(device)
     model_size = cal_model_parm_nums(model)
     logging.info(model)
     logging.info('Number of params: %.4f M' % (model_size / 1e6))
@@ -47,7 +79,7 @@ def main(gpu, cfg, profile=False):
     if profile:
         model.eval()
         B, N, C = 32, 2048, cfg.model.encoder_args.in_channels
-        points = torch.randn(B, N, 3).cuda()
+        points = torch.randn(B, N, 3, device=device)
         # from thop import profile as thop_profile
         # macs, params = thop_profile(model, inputs=(points, features))
         # macs = macs / 1e6
@@ -61,7 +93,8 @@ def main(gpu, cfg, profile=False):
             start_time = time.time()
             for _ in range(n_runs):
                 model(points)
-                torch.cuda.synchronize()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
             time_taken = time.time() - start_time
         print(f'inference time: {time_taken / float(n_runs)}')
         return False
@@ -70,8 +103,12 @@ def main(gpu, cfg, profile=False):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         logging.info('Using Synchronized BatchNorm ...')
     if cfg.distributed:
-        torch.cuda.set_device(gpu)
-        model = nn.parallel.DistributedDataParallel(model.cuda(), device_ids=[cfg.rank], output_device=cfg.rank)
+        if device.type == 'cuda':
+            torch.cuda.set_device(device)
+            model = nn.parallel.DistributedDataParallel(
+                model, device_ids=[device.index], output_device=device.index)
+        else:
+            model = nn.parallel.DistributedDataParallel(model)
         logging.info('Using Distributed Data parallel ...')
 
     # optimizer & scheduler
@@ -79,6 +116,7 @@ def main(gpu, cfg, profile=False):
     scheduler = build_scheduler_from_cfg(cfg, optimizer)
 
     # build dataset
+    from openpoints.dataset import build_dataloader_from_cfg
     train_loader = build_dataloader_from_cfg(cfg.batch_size,
                                              cfg.dataset,
                                              cfg.dataloader,
@@ -147,15 +185,18 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, cfg):
     model.train()  # set model to training mode
     pbar = tqdm(enumerate(train_loader), total=train_loader.__len__())
     num_iter = 0
+    device = torch.device(cfg.device)
     for idx, data in pbar:
-        for key in data.keys():
-            data[key] = data[key].cuda(non_blocking=True)
+        data = _move_batch_to_device(data, device)
         num_iter += 1
         points = data['pos'][:, :, :3].contiguous()
         # data['x'] = data['x'][:, :, :cfg.model.encoder_args.in_channels].transpose(1, 2).contiguous()
         num_curr_pts = points.shape[1]
         if num_curr_pts != npoints:
-            points = fps(points, npoints)
+            if device.type == 'cuda' and fps is not None:
+                points = fps(points, npoints)
+            else:
+                points = _random_resample_points(points, npoints)
 
         loss, pred = model(points)
 
@@ -181,14 +222,18 @@ def validate(model, val_loader, cfg):
 
     loss_meter = AverageMeter()
     npoints = cfg.num_points
+    device = torch.device(cfg.device)
 
     pbar = tqdm(enumerate(val_loader), total=val_loader.__len__())
     for idx, data in pbar:
-        points = data['pos'].cuda(non_blocking=True)
+        points = data['pos'].to(device, non_blocking=(device.type == "cuda"))
 
         num_curr_pts = points.shape[1]
         if num_curr_pts != npoints:
-            points = fps(points, npoints)
+            if device.type == 'cuda' and fps is not None:
+                points = fps(points, npoints)
+            else:
+                points = _random_resample_points(points, npoints)
 
         loss, pred = model(points)
         loss_meter.update(loss.item())

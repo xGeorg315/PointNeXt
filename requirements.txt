@@ -3,6 +3,7 @@ pickleshare==0.7.5
 ninja==1.10.2.3
 gdown
 easydict==1.9
+numpy<2
 PyYAML==6.0
 protobuf==3.19.4
 tensorboard==2.8.0

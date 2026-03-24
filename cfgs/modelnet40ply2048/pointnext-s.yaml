@@ -8,6 +8,7 @@
 
 model:
   NAME: BaseCls
+  extra_global_channels: 0  # obj_dims (3) + sensor_dist (1)
   encoder_args:
     NAME: PointNextEncoder
     blocks: [1, 1, 1, 1, 1, 1]
@@ -34,7 +35,7 @@ model:
       norm: 'bn'
   cls_args: 
     NAME: ClsHead
-    num_classes: 40
-    mlps: [512, 256]
+    num_classes: 8
+    mlps: [512, 256, 128, 64]
     norm_args: 
       norm: 'bn1d'

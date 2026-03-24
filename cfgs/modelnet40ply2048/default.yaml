@@ -14,16 +14,16 @@ dataset:
 feature_keys: pos
 
 datatransforms:
-  train: [PointsToTensor, PointCloudScaleAndTranslate]  # rotation does not help
-  vote: [PointCloudScaleAndTranslate]
+  train: [PointsToTensor]  # rotation does not help
+  vote: [PointsToTensor]
   val: [PointsToTensor]
   kwargs:
     shift: [0.2, 0.2, 0.2]
-batch_size: 32
+batch_size: 64
 dataloader:
-  num_workers: 6
+  num_workers: 4
 
-num_classes: 40
+num_classes: 8
 # ---------------------------------------------------------------------------- #
 # Training cfgs
 # ---------------------------------------------------------------------------- #
@@ -34,7 +34,7 @@ num_classes: 40
 # ---------------------------------------------------------------------------- #
 # this one is better. 
 sched: cosine
-epochs: 600
+epochs: 100
 warmup_epochs: 0
 min_lr: null 
 
