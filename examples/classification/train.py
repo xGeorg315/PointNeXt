@@ -99,6 +99,27 @@ def _max_batches_for_split(cfg, split):
     return int(cfg.get("fast_run_val_batches", 2))
 
 
+def _wandb_is_active(cfg):
+    return cfg.rank == 0 and _as_bool(cfg.wandb.use_wandb) and wandb.run is not None
+
+
+def _wandb_per_class_metrics(prefix, accs, cfg):
+    if accs is None:
+        return {}
+    class_names = cfg.get('classes', None)
+    metrics = {}
+    for i, acc in enumerate(accs):
+        cname = class_names[i] if class_names is not None and i < len(class_names) else f"class_{i}"
+        metrics[f"{prefix}/acc_per_class/{cname}"] = float(acc)
+    return metrics
+
+
+def _log_wandb_epoch_metrics(cfg, epoch, metrics):
+    if not _wandb_is_active(cfg):
+        return
+    wandb.log(metrics, step=epoch)
+
+
 def _build_loaders(cfg):
     custom_root = cfg.get('custom_dataset_root', None)
     if not custom_root:
@@ -251,7 +272,7 @@ def _log_wandb_val_pcds(cfg, epoch, split, samples, wrong_samples):
             _pcd_to_wandb_object3d(item["points"]),
         )
 
-    log_payload = {f"{split}/pcd_examples": all_table}
+    log_payload = {"epoch": epoch, f"{split}/pcd_examples": all_table}
     if len(wrong_samples) > 0:
         wrong_table = wandb.Table(columns=["id", "true_label", "pred_label", "point_cloud"])
         for item in wrong_samples:
@@ -263,7 +284,7 @@ def _log_wandb_val_pcds(cfg, epoch, split, samples, wrong_samples):
             )
         log_payload[f"{split}/pcd_misclassified"] = wrong_table
 
-    wandb.log(log_payload, step=epoch)
+    wandb.log(log_payload)
 
 
 def _log_wandb_confusion_matrix(cfg, epoch, split, cm):
@@ -285,7 +306,10 @@ def _log_wandb_confusion_matrix(cfg, epoch, split, cm):
     fig = _build_confusion_matrix_figure(
         mat_norm, class_names, f"{split} Confusion Matrix (normalized)"
     )
-    wandb.log({f"{split}/confusion_matrix": wandb.Image(fig)}, step=epoch)
+    wandb.log({
+        "epoch": epoch,
+        f"{split}/confusion_matrix": wandb.Image(fig),
+    })
     plt.close(fig)
 
 
@@ -462,6 +486,21 @@ def main(gpu, cfg, profile=False):
         lr = optimizer.param_groups[0]['lr']
         logging.info(f'Epoch {epoch} LR {lr:.6f} '
                      f'train_oa {train_oa:.2f}, val_oa {val_oa:.2f}, best val oa {best_val:.2f}')
+        wandb_metrics = {
+            'epoch': epoch,
+            'lr': float(lr),
+            'train_loss': float(train_loss),
+            'train_oa': float(train_oa),
+            'train_macc': float(train_macc),
+            'val_oa': float(val_oa),
+            'val_macc': float(val_macc),
+            'mAcc_when_best': float(macc_when_best),
+            'best_val': float(best_val),
+        }
+        wandb_metrics.update(_wandb_per_class_metrics("train", train_accs, cfg))
+        if epoch % cfg.val_freq == 0:
+            wandb_metrics.update(_wandb_per_class_metrics("val", val_accs, cfg))
+        _log_wandb_epoch_metrics(cfg, epoch, wandb_metrics)
         if writer is not None:
             writer.add_scalar('train_loss', train_loss, epoch)
             writer.add_scalar('train_oa', train_macc, epoch)
@@ -488,6 +527,11 @@ def main(gpu, cfg, profile=False):
     # test the last epoch
     test_macc, test_oa, test_accs, test_cm = validate(model, test_loader, cfg)
     print_cls_results(test_oa, test_macc, test_accs, best_epoch, cfg)
+    _log_wandb_epoch_metrics(cfg, epoch, {
+        'epoch': epoch,
+        'test_oa': float(test_oa),
+        'test_macc': float(test_macc),
+    })
     if writer is not None:
         writer.add_scalar('test_oa', test_oa, epoch)
         writer.add_scalar('test_macc', test_macc, epoch)
@@ -496,6 +540,11 @@ def main(gpu, cfg, profile=False):
     best_epoch, _ = load_checkpoint(model, pretrained_path=os.path.join(
         cfg.ckpt_dir, f'{cfg.run_name}_ckpt_best.pth'))
     test_macc, test_oa, test_accs, test_cm = validate(model, test_loader, cfg)
+    _log_wandb_epoch_metrics(cfg, best_epoch, {
+        'epoch': int(best_epoch),
+        'best_test_oa': float(test_oa),
+        'best_test_macc': float(test_macc),
+    })
     if writer is not None:
         writer.add_scalar('test_oa', test_oa, best_epoch)
         writer.add_scalar('test_macc', test_macc, best_epoch)

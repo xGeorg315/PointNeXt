@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=pointnext-train
+#SBATCH --job-name=pointnext-fast
 #SBATCH --output=slurm_logs/%x.%j.out
 #SBATCH --error=slurm_logs/%x.%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
 #SBATCH --partition=gpu1
+#SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=2
 
 set -euo pipefail
 
 PROJECT_ROOT="/beegfs/scratch/workspace/es_gemiit01-pointnext_a42/PointNeXt"
-TRAIN_SCRIPT="${PROJECT_ROOT}/examples/classification/start_train.sh"
+FAST_RUN_SCRIPT="${PROJECT_ROOT}/examples/classification/fast_run.sh"
 
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_logs
-
-# Optional: only enable if your cluster needs modules/conda activation.
-# module load cuda/11.1.1
-# module load gcc
 source .venv/bin/activate
 
-bash "${TRAIN_SCRIPT}"
+bash "${FAST_RUN_SCRIPT}"

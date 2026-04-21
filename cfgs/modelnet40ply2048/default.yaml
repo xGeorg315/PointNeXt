@@ -19,7 +19,7 @@ datatransforms:
   val: [PointsToTensor]
   kwargs:
     shift: [0.2, 0.2, 0.2]
-batch_size: 64
+batch_size: 16
 dataloader:
   num_workers: 4
 
@@ -63,5 +63,6 @@ pretrained_path: null
 
 wandb:
   project: PointNeXt-ModelNet40Ply2048
+  sync_tensorboard: False
 
 seed: null

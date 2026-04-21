@@ -3,6 +3,7 @@ import os, argparse, yaml, numpy as np
 from torch import multiprocessing as mp
 from examples.classification.train import main as train
 from examples.classification.pretrain import main as pretrain
+from examples.classification.completion_train import main as completion_train
 from openpoints.utils import EasyConfig, dist_utils, find_free_port, generate_exp_directory, resume_exp_directory, Wandb
 
 
@@ -50,10 +51,13 @@ if __name__ == "__main__":
         yaml.dump(cfg, f, indent=2)
         os.system('cp %s %s' % (args.cfg, cfg.run_dir))
     cfg.cfg_path = cfg_path
-    cfg.wandb.name = cfg.run_name
+    if not cfg.wandb.get('name', None):
+        cfg.wandb.name = cfg.run_name
 
     if cfg.mode == 'pretrain':
         main = pretrain
+    elif cfg.get('task', None) == 'completion_cls':
+        main = completion_train
     else:
         main = train
 

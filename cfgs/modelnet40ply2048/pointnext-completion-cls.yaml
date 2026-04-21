@@ -1,0 +1,61 @@
+# Multi-task partial-to-complete reconstruction with auxiliary classification.
+# Run from the PointNeXt directory, e.g.:
+# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-completion-cls.yaml
+
+task: completion_cls
+custom_dataset_root: ../handcrafted_dataset_v1
+
+num_points: 1024
+num_complete: 2048
+batch_size: 16
+val_batch_size: 8
+
+completion_target_strategy: aggregate
+completion_partial_choice: random_far
+completion_min_dist_delta: 0.0
+
+wandb_vis_max_samples: 4
+
+model:
+  NAME: PointNextCompletionCls
+  in_channels: 3
+  extra_global_channels: 4  # obj_dims (3) + sensor_dist (1)
+  loss_weights:
+    fine: 1.0
+    coarse: 0.5
+    cls: 0.2
+  encoder_args:
+    NAME: PointNextEncoder
+    blocks: [1, 1, 1, 1, 1, 1]
+    strides: [1, 2, 2, 2, 2, 1]
+    width: 32
+    in_channels: 3
+    radius: 0.15
+    radius_scaling: 1.5
+    sa_layers: 2
+    sa_use_res: True
+    nsample: 32
+    expansion: 4
+    aggr_args:
+      feature_type: 'dp_fj'
+      reduction: 'max'
+    group_args:
+      NAME: 'ballquery'
+      normalize_dp: True
+    conv_args:
+      order: conv-norm-act
+    act_args:
+      act: 'relu'
+    norm_args:
+      norm: 'bn'
+  decoder_args:
+    NAME: FoldingNet
+    num_fine: 2048
+    grid_size: 2
+    emb_dims: 1024
+  cls_args:
+    NAME: ClsHead
+    num_classes: 8
+    mlps: [512, 256, 128, 64]
+    norm_args:
+      norm: 'bn1d'
