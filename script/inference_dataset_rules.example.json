@@ -1,0 +1,78 @@
+{
+  "target_column": "predicted_class",
+  "source_column": "folder_class",
+  "rules": {
+    "TLS_VEHICLE_BUS": {
+      "allow_sources": [
+        "*"
+      ],
+      "require_equal": [
+        "folder_class",
+        "predicted_class"
+      ],
+      "match_mode": "or"
+    },
+    "TLS_VEHICLE_CAR": {
+      "allow_sources": [
+        "TLS_VEHICLE_CAR"
+      ],
+      "require_equal": [
+        "folder_class",
+        "class_name",
+        "predicted_class"
+      ],
+      "match_mode": "and"
+    },
+    "TLS_VEHICLE_MOTORBIKE": {
+      "allow_sources": [
+        "TLS_VEHICLE_MOTORBIKE"
+      ],
+      "require_equal": [
+        "folder_class",
+        "predicted_class"
+      ],
+      "match_mode": "or"
+    },
+    "TLS_VEHICLE_SEMI_TRAILER_TRUCK": {
+      "allow_sources": [
+        "TLS_VEHICLE_TRUCK",
+        "TLS_VEHICLE_SEMI_TRAILER_TRUCK"
+      ],
+      "require_equal": [
+        "predicted_class",
+        "folder_class"
+      ],
+      "match_mode": "and"
+    },
+    "TLS_VEHICLE_TRAILER": {
+      "allow_sources": [
+        "*"
+      ],
+      "require_equal": [
+        "predicted_class"
+      ]
+    },
+    "TLS_VEHICLE_TRUCK": {
+      "allow_sources": [
+        "TLS_VEHICLE_TRUCK",
+        "TLS_VEHICLE_SEMI_TRAILER_TRUCK"
+      ],
+      "require_equal": [
+        "folder_class",
+        "predicted_class"
+      ],
+      "match_mode": "and"
+    },
+    "TLS_VEHICLE_VAN": {
+      "allow_sources": [
+        "TLS_VEHICLE_VAN"
+      ],
+      "require_equal": [
+        "folder_class",
+        "predicted_class"
+      ],
+      "match_mode": "and"
+    },
+    "*": []
+  }
+}

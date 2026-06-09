@@ -1,0 +1,91 @@
+# Full dimension finetune from seed 7332.
+# Recommended second stage after the head-only dimension finetune.
+# After the head-only run, replace pretrained_path with its best checkpoint if desired.
+# Start:
+# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-extra-classes-dims-full-seed7332.yaml
+
+mode: finetune
+finetune_freeze_encoder: False
+load_checkpoint_skip_shape_mismatch: True
+obj_features_include_sensor_dist: False
+pretrained_path: /home/georg/workspace/PointNeXt/log/modelnet40ply2048/modelnet40ply2048-train-pointnext-extra-classes-ngpus1-seed7332-20260608-214050-aawRcPYJrDipF79Jm5XZsa/checkpoint/modelnet40ply2048-train-pointnext-extra-classes-ngpus1-seed7332-20260608-214050-aawRcPYJrDipF79Jm5XZsa_ckpt_best.pth
+
+classification_dataset_format: review
+custom_dataset_root: /home/georg/extra-classes
+review_buckets: [gt-pred-diff, gt-pred-same]
+review_source_dir: pred
+review_split_ratios: [0.8, 0.1, 0.1]
+review_start_date: null
+review_min_points: 0
+max_samples_per_class: 2000
+exclude_classes:
+  - TLS_VEHICLE_CAR_WITH_TRAILER
+  - TLS_VEHICLE_TRUCK_WITH_TRAILER
+
+batch_size: 45
+val_batch_size: 45
+class_balanced_batches: False
+class_rebalance_mode: repeat_underrepresented
+rebalance_max_repeat_per_sample: 4
+auto_class_weights: effective_epoch
+auto_class_weight_strategy: inverse_sqrt
+preload_data: True
+augment_train: True
+augment_rotation_deg: 10.0
+augment_scale: [1.0, 1.0]
+augment_jitter_sigma: 0.01
+augment_jitter_clip: 0.05
+augment_dropout: [0.1, 0.4]
+augment_translate: 0.1
+augment_random_points_ratio: 0.0
+augment_random_points_scale: 1.5
+use_normals: False
+normal_k: 16
+
+epochs: 15
+lr: 0.00003
+criterion_args:
+  NAME: SmoothCrossEntropy
+  label_smoothing: 0.2
+  # weight is filled automatically from effective per-epoch class counts
+  # after repeat_underrepresented sampling.
+
+save_local_metrics: True
+wandb_log_confusion_matrices: False
+wandb_log_pcd_examples: False
+wandb_vis_max_samples: 0
+wandb_vis_max_wrong_samples: 32
+
+model:
+  NAME: BaseCls
+  extra_global_channels: 3
+  encoder_args:
+    NAME: PointNextEncoder
+    blocks: [1, 1, 1, 1, 1, 1]
+    strides: [1, 2, 2, 2, 2, 1]
+    width: 16
+    in_channels: 3
+    radius: 0.15
+    radius_scaling: 1.5
+    sa_layers: 2
+    sa_use_res: True
+    nsample: 32
+    expansion: 4
+    aggr_args:
+      feature_type: dp_fj
+      reduction: max
+    group_args:
+      NAME: ballquery
+      normalize_dp: True
+    conv_args:
+      order: conv-norm-act
+    act_args:
+      act: relu
+    norm_args:
+      norm: bn
+  cls_args:
+    NAME: ClsHead
+    num_classes: 9
+    mlps: [512, 256, 128, 64]
+    norm_args:
+      norm: bn1d

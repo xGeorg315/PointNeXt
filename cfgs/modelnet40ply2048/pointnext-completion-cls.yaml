@@ -4,22 +4,37 @@
 
 task: completion_cls
 custom_dataset_root: ../handcrafted_dataset_v1
+# Fuer /home/georg/review-dataset:
+custom_dataset_root: /home/georg/review-dataset
+completion_dataset_format: review
+review_start_date: "2026-04-01"
+review_min_points: 1024
+review_split_ratios: [0.8, 0.1, 0.1]
+review_buckets: ["gt-pred-same", "gt-pred-different"]
+review_exclude_classes: ["reject"]
+review_min_points_exempt_classes: ["TLS_VEHICLE_MOTORBIKE", "TLS_VEHICLE_TRAILER"]
+completion_symmetry: True
+completion_symmetry_axis: "x"
+completion_symmetry_source: "partial"
+completion_symmetry_keep_side: "auto"
 
 num_points: 1024
 num_complete: 2048
-batch_size: 16
-val_batch_size: 8
+batch_size: 18
+val_batch_size: 9
 
 completion_target_strategy: aggregate
 completion_partial_choice: random_far
 completion_min_dist_delta: 0.0
 
 wandb_vis_max_samples: 4
+save_wandb_pointclouds_local: True
+local_pointcloud_dir: null
 
 model:
   NAME: PointNextCompletionCls
   in_channels: 3
-  extra_global_channels: 4  # obj_dims (3) + sensor_dist (1)
+  extra_global_channels: 0  # obj_dims (3) + sensor_dist (1)
   loss_weights:
     fine: 1.0
     coarse: 0.5
@@ -52,10 +67,10 @@ model:
     NAME: FoldingNet
     num_fine: 2048
     grid_size: 2
-    emb_dims: 1024
+    emb_dims: 512
   cls_args:
     NAME: ClsHead
-    num_classes: 8
+    num_classes: 9
     mlps: [512, 256, 128, 64]
     norm_args:
       norm: 'bn1d'

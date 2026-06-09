@@ -1,0 +1,121 @@
+# Three-view ModelNet40 OFF classification training.
+# Start:
+# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-three-view-modelnet40-off.yaml
+
+mode: modelnet40_off_classification
+classification_dataset_format: modelnet40_off
+modelnet40_root: /home/georg/ModelNet40
+custom_dataset_root: /home/georg/ModelNet40
+
+num_points: 512
+multi_view: True
+multi_view_axes: [xy, xz, yz]
+multi_view_num_points: 512
+multi_view_bins: 256
+
+batch_size: 32
+val_batch_size: 32
+class_balanced_batches: False
+preload_data: False
+augment_train: True
+augment_rotation_deg: 20.0
+augment_scale: [0.8, 1.2]
+augment_jitter_sigma: 0.01
+augment_jitter_clip: 0.05
+augment_dropout: [0.0, 0.0]
+augment_translate: 0.1
+augment_random_points_ratio: 0.0
+augment_random_points_scale: 1.0
+use_normals: False
+normal_k: 16
+
+epochs: 100
+lr: 0.0001
+criterion_args:
+  NAME: SmoothCrossEntropy
+  label_smoothing: 0.2
+  # Inverse-sqrt train-count weights, normalized to mean 1.
+  # Order follows sorted ModelNet40 class folders:
+  #   airplane
+  #   bathtub
+  #   bed
+  #   bench
+  #   bookshelf
+  #   bottle
+  #   bowl
+  #   car
+  #   chair
+  #   cone
+  #   cup
+  #   curtain
+  #   desk
+  #   door
+  #   dresser
+  #   flower_pot
+  #   glass_box
+  #   guitar
+  #   keyboard
+  #   lamp
+  #   laptop
+  #   mantel
+  #   monitor
+  #   night_stand
+  #   person
+  #   piano
+  #   plant
+  #   radio
+  #   range_hood
+  #   sink
+  #   sofa
+  #   stairs
+  #   stool
+  #   table
+  #   tent
+  #   toilet
+  #   tv_stand
+  #   vase
+  #   wardrobe
+  #   xbox
+  weight: [0.5309, 1.2902, 0.5853, 1.0099, 0.5554, 0.7257, 1.6604, 0.9464, 0.4455, 1.0279, 1.4945, 1.1307, 0.9393, 1.2723, 0.9393, 1.0882, 1.0158, 1.0669, 1.1031, 1.1929, 1.0882, 0.7882, 0.6160, 0.9393, 1.4160, 0.8740, 0.8574, 1.3025, 1.2387, 1.1741, 0.5094, 1.1929, 1.4002, 0.6709, 1.0404, 0.7162, 0.8129, 0.6095, 1.4241, 1.3088]
+
+save_local_metrics: True
+wandb_log_confusion_matrices: False
+wandb_log_pcd_examples: False
+wandb_vis_max_samples: 0
+wandb_vis_max_wrong_samples: 0
+
+model:
+  NAME: MultiViewPointNextCls
+  in_channels: 3
+  num_views: 3
+  extra_global_channels: 0
+  encoder_args:
+    NAME: PointNextEncoder
+    blocks: [1, 1, 1, 1, 1, 1]
+    strides: [1, 2, 2, 2, 2, 1]
+    width: 32
+    in_channels: 3
+    radius: 0.15
+    radius_scaling: 1.5
+    sa_layers: 2
+    sa_use_res: True
+    nsample: 32
+    expansion: 4
+    aggr_args:
+      feature_type: dp_fj
+      reduction: max
+    group_args:
+      NAME: ballquery
+      normalize_dp: True
+    conv_args:
+      order: conv-norm-act
+    act_args:
+      act: relu
+    norm_args:
+      norm: bn
+  cls_args:
+    NAME: ClsHead
+    num_classes: 40
+    mlps: [512, 256, 128, 64]
+    norm_args:
+      norm: bn1d

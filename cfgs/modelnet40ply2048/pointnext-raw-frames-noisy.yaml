@@ -1,0 +1,95 @@
+# Raw-frames classification training for noisy labels / overfitting control.
+# Keeps the dataset unchanged and limits repeat oversampling for small classes.
+# Start:
+# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-raw-frames-noisy.yaml
+
+mode: train
+classification_dataset_format: review
+custom_dataset_root: /home/georg/newest-data/review-dataset
+review_buckets: [gt-pred-different, gt-pred-same]
+review_source_dir: pred
+review_start_date: null
+review_min_points: 0
+raw_frames_split_ratios: [0.8, 0.1, 0.1]
+raw_frames_start_date: null
+raw_frames_min_points: 100
+raw_frames_exclude_classes: [reject]
+raw_frames_min_points_exempt_classes: [TLS_VEHICLE_MOTORBIKE, TLS_VEHICLE_TRAILER]
+exclude_classes:
+  - TLS_VEHICLE_CAR_WITH_TRAILER
+  - TLS_VEHICLE_TRUCK_WITH_TRAILER
+raw_frames_classes:
+  - TLS_VEHICLE_BUS
+  - TLS_VEHICLE_CAR
+  - TLS_VEHICLE_MOTORBIKE
+  - TLS_VEHICLE_SEMI_TRAILER_TRUCK
+  - TLS_VEHICLE_TRAILER
+  - TLS_VEHICLE_TRUCK
+  - TLS_VEHICLE_VAN
+  # - TLS_VEHICLE_CAR_WITH_TRAILER 
+  # - TLS_VEHICLE_TRUCK_WITH_TRAILER
+batch_size: 45
+val_batch_size: 45
+class_balanced_batches: False
+balanced_max_repeat_per_sample: 4
+preload_data: True
+augment_train: True
+augment_rotation_deg: 20.0
+augment_scale: [0.8, 1.2]
+augment_jitter_sigma: 0.01
+augment_jitter_clip: 0.05
+augment_dropout: [0.2, 0.5]
+augment_translate: 0.1
+augment_random_points_ratio: 0.05
+augment_random_points_scale: 1.0
+use_normals: False
+normal_k: 16
+
+epochs: 60
+lr: 0.0001
+criterion_args:
+  NAME: SmoothCrossEntropy
+  label_smoothing: 0.2
+  # Inverse-sqrt train-count weights, normalized to mean 1.
+  # Order follows raw_frames_classes above.
+  weight: [1.535275, 0.807254, 1.125461, 0.886908, 1.351636, 0.873474, 0.891992]
+
+save_local_metrics: True
+wandb_log_confusion_matrices: False
+wandb_log_pcd_examples: False
+wandb_vis_max_samples: 0
+wandb_vis_max_wrong_samples: 32
+
+model:
+  NAME: BaseCls
+  extra_global_channels: 0
+  encoder_args:
+    NAME: PointNextEncoder
+    blocks: [1, 1, 1, 1, 1, 1]
+    strides: [1, 2, 2, 2, 2, 1]
+    width: 16
+    in_channels: 3
+    radius: 0.15
+    radius_scaling: 1.5
+    sa_layers: 2
+    sa_use_res: True
+    nsample: 32
+    expansion: 4
+    aggr_args:
+      feature_type: dp_fj
+      reduction: max
+    group_args:
+      NAME: ballquery
+      normalize_dp: True
+    conv_args:
+      order: conv-norm-act
+    act_args:
+      act: relu
+    norm_args:
+      norm: bn
+  cls_args:
+    NAME: ClsHead
+    num_classes: 7
+    mlps: [512, 256, 128, 64]
+    norm_args:
+      norm: bn1d
