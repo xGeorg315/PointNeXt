@@ -1,34 +1,42 @@
-# PointNext classification training for /home/georg/extra-classes.
-# The dataset is bucket-first: gt-pred-diff/Class/*.pcd and gt-pred-same/Class/*.pcd.
+# Raw-frames classification training for /home/georg/raw-frames.
+# Uses exactly one frame per object_id: the frame with the largest bbox extent.
 # Start:
-# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-extra-classes.yaml
+# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-raw-frames-largest-extent.yaml
 
-mode: train
-classification_dataset_format: review
-custom_dataset_root: /home/georg/extra-classes
-review_buckets: [gt-pred-diff, gt-pred-same]
-review_source_dir: pred
-review_split_ratios: [0.8, 0.1, 0.1]
-review_start_date: null
-review_min_points: 0
-max_samples_per_class: 2000
+mode: raw_frames_classification
+classification_dataset_format: raw_frames
+raw_frames_root: /home/georg/raw-frames
+raw_frames_frame_selection: largest_extent
+raw_frames_split_ratios: [0.8, 0.1, 0.1]
+raw_frames_start_date: null
+raw_frames_min_points: 0
+raw_frames_exclude_classes: [reject, TLS_VEHICLE_CAR_WITH_TRAILER, TLS_VEHICLE_TRUCK_WITH_TRAILER]
+raw_frames_min_points_exempt_classes: [TLS_VEHICLE_MOTORBIKE, TLS_VEHICLE_TRAILER]
+raw_frames_classes:
+  - TLS_VEHICLE_BUS
+  - TLS_VEHICLE_CAR
+  - TLS_VEHICLE_MOTORBIKE
+  - TLS_VEHICLE_SEMI_TRAILER_TRUCK
+  - TLS_VEHICLE_SMALL_TRUCK
+  - TLS_VEHICLE_TRAILER
+  - TLS_VEHICLE_TRUCK
+  - TLS_VEHICLE_VAN
+  - small construction vehicle
+  - small tow truck
 batch_size: 45
 val_batch_size: 45
 class_balanced_batches: False
-class_rebalance_mode: repeat_underrepresented
-rebalance_max_repeat_per_sample: 4
-auto_class_weights: effective_epoch
-auto_class_weight_strategy: inverse_sqrt
+balanced_max_repeat_per_sample: 4
 preload_data: True
 augment_train: True
 augment_rotation_deg: 20.0
 augment_scale: [0.8, 1.2]
 augment_jitter_sigma: 0.01
 augment_jitter_clip: 0.05
-augment_dropout: [0.2, 0.7]
+augment_dropout: [0.2, 0.5]
 augment_translate: 0.1
-augment_random_points_ratio: 0.0
-augment_random_points_scale: 1.5
+augment_random_points_ratio: 0.05
+augment_random_points_scale: 1.0
 use_normals: False
 normal_k: 16
 
@@ -37,8 +45,6 @@ lr: 0.0001
 criterion_args:
   NAME: SmoothCrossEntropy
   label_smoothing: 0.2
-  # weight is filled automatically from effective per-epoch class counts
-  # after repeat_underrepresented sampling.
 
 save_local_metrics: True
 wandb_log_confusion_matrices: False
@@ -75,7 +81,7 @@ model:
       norm: bn
   cls_args:
     NAME: ClsHead
-    num_classes: 9
+    num_classes: 10
     mlps: [512, 256, 128, 64]
     norm_args:
       norm: bn1d

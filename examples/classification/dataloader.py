@@ -868,18 +868,13 @@ class PointCloudDataset(Dataset):
             base_points = points[base_idx]
 
             missing = target_count - n
-            repeat_idx = np.random.choice(base_points.shape[0], missing, replace=True)
+            repeat_idx = torch.randint(
+                low=0,
+                high=base_points.shape[0],
+                size=(missing,),
+            ).numpy()
             extra_points = base_points[repeat_idx]
             points = np.concatenate([base_points, extra_points], axis=0)
-
-            # Jitter NUR beim Oversampling
-            if jitter and self.jitter_std > 0:
-                noise = np.random.normal(
-                    loc=0.0,
-                    scale=self.jitter_std,
-                    size=points.shape
-                )
-                points = points + noise
 
         return points.astype(np.float32, copy=False)
 
@@ -2166,6 +2161,12 @@ class RawFramesClassificationDataset(PointCloudDataset):
         exclude_classes=("reject",),
         min_points_exempt_classes=("TLS_VEHICLE_MOTORBIKE", "TLS_VEHICLE_TRAILER"),
         forced_classes=None,
+        frame_selection="all",
+        object_multi_view=False,
+        max_views=5,
+        view_selection="uniform",
+        pose_metadata_root=None,
+        pose_required=False,
         augment_train=False,
         augment_rotation_deg=20.0,
         augment_scale=(0.8, 1.2),
@@ -2191,6 +2192,15 @@ class RawFramesClassificationDataset(PointCloudDataset):
         self.raw_frames_exclude_classes = set(_as_name_list(exclude_classes))
         self.raw_frames_min_points_exempt_classes = set(_as_name_list(min_points_exempt_classes))
         self.raw_frames_forced_classes = _as_name_list(forced_classes)
+        self.raw_frames_frame_selection = str(frame_selection or "all").lower()
+        self.raw_frames_object_multi_view = _as_bool(object_multi_view)
+        self.raw_frames_max_views = max(1, int(max_views or 5))
+        self.raw_frames_view_selection = str(view_selection or "uniform").lower()
+        self.raw_frames_pose_metadata_root = (
+            Path(pose_metadata_root) if pose_metadata_root else None
+        )
+        self.raw_frames_pose_required = _as_bool(pose_required)
+        self._raw_frames_pose_cache = {}
         super().__init__(
             root_dir=root_dir,
             split=split,
@@ -2248,13 +2258,15 @@ class RawFramesClassificationDataset(PointCloudDataset):
             if class_dir is None:
                 continue
             label = self.class_to_idx[class_name]
-            for object_dir in sorted(class_dir.iterdir()):
-                if not object_dir.is_dir():
-                    continue
-                object_id = object_dir.name
+            pcd_roots = [class_dir / "pcds"] if (class_dir / "pcds").is_dir() else [
+                p for p in sorted(class_dir.iterdir()) if p.is_dir()
+            ]
+            for pcd_root in pcd_roots:
+                object_id_from_dir = None if pcd_root.name == "pcds" else pcd_root.name
 
-                for pcd_file in sorted(object_dir.glob("*.pcd")):
+                for pcd_file in sorted(pcd_root.glob("*.pcd")):
                     metadata = self._load_metadata(pcd_file)
+                    object_id = object_id_from_dir or self._parse_object_id(pcd_file)
                     day = metadata.get("day")
                     if day:
                         try:
@@ -2287,17 +2299,22 @@ class RawFramesClassificationDataset(PointCloudDataset):
                         "class_name": class_dir.name,
                         "object_id": str(metadata.get("gt_object_id") or object_id),
                         "sample_id": str(sample_id),
+                        "group_id": str(metadata.get("sample_id") or re.sub(r"__frame_[^_]+$", "", pcd_file.stem)),
                         "frame_id": str(frame_id),
                         "dist": self._metadata_distance(pcd_file, metadata=metadata),
+                        "extent": self._metadata_extent(pcd_file, metadata=metadata),
+                        "point_count": point_count,
                     }
                     all_records.append(record)
 
+        all_records = self._select_raw_frame_records(all_records)
         split_by_key = self._stratified_split_map(all_records)
-        self.samples = [
+        split_records = [
             record
             for record in all_records
             if split_by_key[self._record_key(record)] == self.split
         ]
+        self.samples = self._group_object_views(split_records)
         self._min_sensor_distance = min((record["dist"] for record in self.samples), default=0.0)
 
     def _collect_flat_classification_samples(self):
@@ -2344,12 +2361,133 @@ class RawFramesClassificationDataset(PointCloudDataset):
                         "label": label,
                         "class_name": class_name,
                         "object_id": object_id,
+                        "group_id": str(metadata.get("sample_id") or re.sub(r"__frame_[^_]+$", "", pcd_file.stem)),
                         "sample_id": str(sample_id),
                         "frame_id": str(frame_id),
                         "dist": self._metadata_distance(pcd_file, metadata=metadata),
+                        "extent": self._metadata_extent(pcd_file, metadata=metadata),
+                        "point_count": point_count,
                     }
                 )
+        self.samples = self._select_raw_frame_records(self.samples)
+        self.samples = self._group_object_views(self.samples)
         self._min_sensor_distance = min((record["dist"] for record in self.samples), default=0.0)
+
+    def _frame_pose_transform(self, record):
+        if self.raw_frames_pose_metadata_root is None:
+            return None
+        aggregate_stem = re.sub(
+            r"__frame_[^_]+$", "", Path(record["file"]).stem
+        )
+        metadata_path = (
+            self.raw_frames_pose_metadata_root
+            / record["class_name"] / "json" / f"{aggregate_stem}.json"
+        )
+        cached = self._raw_frames_pose_cache.get(metadata_path)
+        if cached is None:
+            pose_by_frame = {}
+            try:
+                with metadata_path.open("r", encoding="utf-8") as handle:
+                    metadata = json.load(handle)
+                for item in metadata.get("final_frame_poses", []):
+                    pose = item.get("pose_6d_radians")
+                    transform = item.get("transform")
+                    if not item.get("accepted", False) or pose is None or transform is None:
+                        continue
+                    pose_by_frame[str(int(item["frame_id"]))] = np.asarray(
+                        transform, dtype=np.float32
+                    )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pose_by_frame = {}
+            self._raw_frames_pose_cache[metadata_path] = pose_by_frame
+            cached = pose_by_frame
+        try:
+            frame_id = str(int(record["frame_id"]))
+        except (TypeError, ValueError):
+            frame_id = str(record["frame_id"])
+        return cached.get(frame_id)
+
+    def _filter_pose_records(self, records):
+        if self.raw_frames_pose_metadata_root is None:
+            return records
+        filtered = []
+        for record in records:
+            transform = self._frame_pose_transform(record)
+            if transform is None and self.raw_frames_pose_required:
+                continue
+            record = dict(record)
+            record["pose_transform"] = transform
+            filtered.append(record)
+        return filtered
+
+    def _group_object_views(self, records):
+        if not self.raw_frames_object_multi_view:
+            return records
+
+        grouped = {}
+        for record in records:
+            key = self._record_group_key(record)
+            grouped.setdefault(key, []).append(record)
+
+        samples = []
+        for key in sorted(grouped):
+            views = self._select_object_views(grouped[key])
+            representative = max(views, key=self._largest_extent_sort_key)
+            sample = dict(representative)
+            sample["view_records"] = views
+            sample["num_views"] = len(views)
+            samples.append(sample)
+        return samples
+
+    def _select_object_views(self, records):
+        records = sorted(records, key=self._frame_order_key)
+        if len(records) <= self.raw_frames_max_views:
+            return records
+        if self.raw_frames_view_selection in {"largest_extent", "max_extent"}:
+            selected = sorted(
+                records,
+                key=self._largest_extent_sort_key,
+                reverse=True,
+            )[:self.raw_frames_max_views]
+            return sorted(selected, key=self._frame_order_key)
+        if self.raw_frames_view_selection not in {"uniform", "even"}:
+            raise ValueError(
+                f"Unsupported raw_frames_view_selection: {self.raw_frames_view_selection}"
+            )
+        indices = np.linspace(0, len(records) - 1, self.raw_frames_max_views, dtype=np.int64)
+        return [records[int(index)] for index in indices]
+
+    def _frame_order_key(self, record):
+        frame_id = str(record.get("frame_id", ""))
+        try:
+            frame_key = (0, int(frame_id))
+        except ValueError:
+            frame_key = (1, frame_id)
+        return frame_key, self._record_sort_key(record)
+
+    def _select_raw_frame_records(self, records):
+        records = self._filter_pose_records(records)
+        if self.raw_frames_frame_selection in {"all", "", "none"}:
+            return records
+        if self.raw_frames_frame_selection not in {"largest_extent", "max_extent"}:
+            raise ValueError(
+                f"Unsupported raw_frames_frame_selection: {self.raw_frames_frame_selection}"
+            )
+
+        selected = {}
+        for record in records:
+            group_key = self._record_group_key(record)
+            previous = selected.get(group_key)
+            if previous is None or self._largest_extent_sort_key(record) > self._largest_extent_sort_key(previous):
+                selected[group_key] = record
+        return [selected[key] for key in sorted(selected)]
+
+    def _largest_extent_sort_key(self, record):
+        return (
+            float(record.get("extent", 0.0) or 0.0),
+            int(record.get("point_count", 0) or 0),
+            self._record_sort_key(record),
+        )
 
     @staticmethod
     def _parse_object_id(file_path: Path):
@@ -2358,14 +2496,19 @@ class RawFramesClassificationDataset(PointCloudDataset):
 
     @staticmethod
     def _load_metadata(file_path: Path):
-        meta_path = file_path.with_suffix(".json")
-        if not meta_path.exists():
-            return {}
-        try:
-            with meta_path.open("r", encoding="utf-8") as handle:
-                return json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            return {}
+        candidates = [file_path.with_suffix(".json")]
+        if file_path.parent.name == "pcds":
+            stem_without_frame = re.sub(r"__frame_[^_]+$", "", file_path.stem)
+            candidates.append(file_path.parent.parent / "json" / f"{stem_without_frame}.json")
+        for meta_path in candidates:
+            if not meta_path.exists():
+                continue
+            try:
+                with meta_path.open("r", encoding="utf-8") as handle:
+                    return json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+        return {}
 
     @staticmethod
     def _parse_frame_id(file_path: Path):
@@ -2378,7 +2521,7 @@ class RawFramesClassificationDataset(PointCloudDataset):
 
     @staticmethod
     def _record_group_key(record):
-        return str(record["object_id"])
+        return f"{record['class_name']}::{record.get('group_id', record['object_id'])}"
 
     def _record_sort_key(self, record):
         key = self._record_key(record)
@@ -2449,8 +2592,29 @@ class RawFramesClassificationDataset(PointCloudDataset):
                 return abs(float(metrics[key]))
         return 0.0
 
+    @staticmethod
+    def _metadata_extent(file_path: Path, metadata=None):
+        if metadata is None:
+            metadata = RawFramesClassificationDataset._load_metadata(file_path)
+        metrics = metadata.get("metrics", {}) if isinstance(metadata, dict) else {}
+        extents = []
+        for key in ("x_extent", "y_extent", "z_extent"):
+            value = metrics.get(key)
+            if value is not None:
+                extents.append(abs(float(value)))
+        if extents:
+            return max(extents)
+
+        points = RawFramesClassificationDataset._load_xyz(file_path)
+        mins = points[:, :3].min(axis=0)
+        maxs = points[:, :3].max(axis=0)
+        return float(np.max(maxs - mins))
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        if self.raw_frames_object_multi_view:
+            return self._get_object_views(sample)
+
         points = self._load_points(sample["file"])
         obj_features = self._obj_features(points, sample["dist"])
 
@@ -2475,6 +2639,127 @@ class RawFramesClassificationDataset(PointCloudDataset):
         }
         return self._add_multi_view_if_needed(output, points)
 
+    def _prepare_view_points(self, record, apply_geometric_augmentations=True):
+        points = self._load_points(record["file"])
+        if self.normalize:
+            points = self._normalize(points)
+        points = self._apply_point_dropout(points)
+        points = self._include_random_points(points)
+        points = self._resample(
+            points,
+            target_count=self.num_points,
+            jitter=self.split == "train",
+        )
+        if self.normalize:
+            points = self._scale_to_unit_radius(points)[0]
+        if apply_geometric_augmentations:
+            points = self._apply_geometric_augmentations(points)
+        return points
+
+    def _get_object_views(self, sample):
+        view_records = sample["view_records"]
+        pose_supervision = self.raw_frames_pose_metadata_root is not None
+        normalization_centroid = np.zeros(3, dtype=np.float32)
+        normalization_radius = 1.0
+
+        if pose_supervision:
+            raw_views = [self._load_points(record["file"]) for record in view_records]
+            if self.normalize:
+                normalization_centroid = np.mean(raw_views[0], axis=0)
+                centered_views = [
+                    points - normalization_centroid for points in raw_views
+                ]
+                normalization_radius = self._unit_radius(
+                    np.concatenate(centered_views, axis=0)
+                )
+            prepared_views = []
+            for points in raw_views:
+                if self.normalize:
+                    points = self._normalize_with_centroid(
+                        points, normalization_centroid, normalization_radius
+                    )
+                points = self._apply_point_dropout(points)
+                points = self._include_random_points(points)
+                points = self._resample(
+                    points, target_count=self.num_points,
+                    jitter=self.split == "train",
+                )
+                prepared_views.append(points.astype(np.float32, copy=False))
+        else:
+            prepared_views = [
+                self._prepare_view_points(
+                    record, apply_geometric_augmentations=False
+                )
+                for record in view_records
+            ]
+            if prepared_views:
+                stacked_views = np.concatenate(prepared_views, axis=0)
+                stacked_views = self._apply_geometric_augmentations(stacked_views)
+                prepared_views = list(
+                    stacked_views.reshape(
+                        len(prepared_views), self.num_points,
+                        stacked_views.shape[-1],
+                    )
+                )
+
+        feature_dim = self._point_features(prepared_views[0]).shape[1]
+        views = np.zeros(
+            (self.raw_frames_max_views, self.num_points, feature_dim),
+            dtype=np.float32,
+        )
+        view_mask = np.zeros(self.raw_frames_max_views, dtype=np.bool_)
+        pose_rotations = np.tile(
+            np.eye(3, dtype=np.float32),
+            (self.raw_frames_max_views, 1, 1),
+        )
+        pose_translations = np.zeros(
+            (self.raw_frames_max_views, 3), dtype=np.float32
+        )
+        pose_mask = np.zeros(self.raw_frames_max_views, dtype=np.bool_)
+
+        transforms = [record.get("pose_transform") for record in view_records]
+        anchor_transform = transforms[0] if transforms else None
+        anchor_inverse = (
+            np.linalg.inv(anchor_transform)
+            if anchor_transform is not None else None
+        )
+        for view_idx, (record, points) in enumerate(
+                zip(view_records, prepared_views)):
+            views[view_idx] = self._point_features(points)
+            view_mask[view_idx] = True
+            transform = record.get("pose_transform")
+            if transform is None or anchor_inverse is None:
+                continue
+            relative = np.matmul(anchor_inverse, transform)
+            rotation = relative[:3, :3].astype(np.float32, copy=False)
+            translation = relative[:3, 3].astype(np.float32, copy=False)
+            if self.normalize:
+                translation = (
+                    np.matmul(rotation, normalization_centroid)
+                    + translation - normalization_centroid
+                ) / normalization_radius
+            pose_rotations[view_idx] = rotation
+            pose_translations[view_idx] = translation
+            pose_mask[view_idx] = True
+
+        representative_points = prepared_views[0]
+        sensor_dist = float(np.mean([record["dist"] for record in view_records]))
+        obj_features = self._obj_features(representative_points, sensor_dist)
+        return {
+            "views": torch.from_numpy(views).float(),
+            "view_mask": torch.from_numpy(view_mask),
+            "pose_rotations": torch.from_numpy(pose_rotations).float(),
+            "pose_translations": torch.from_numpy(pose_translations).float(),
+            "pose_mask": torch.from_numpy(pose_mask),
+            "x": torch.from_numpy(views[0]).float(),
+            "pos": torch.from_numpy(representative_points).float(),
+            "y": torch.tensor(sample["label"]).long(),
+            "obj_features": torch.from_numpy(obj_features).float(),
+            "object_id": sample["object_id"],
+            "sample_id": sample["sample_id"],
+            "frame_id": sample["frame_id"],
+        }
+
 
 def get_raw_frames_classification_dataloader(
     dataset_root,
@@ -2491,6 +2776,12 @@ def get_raw_frames_classification_dataloader(
     class_balanced_batches=True,
     balanced_max_repeat_per_sample=None,
     forced_classes=None,
+    frame_selection="all",
+    object_multi_view=False,
+    max_views=5,
+    view_selection="uniform",
+    pose_metadata_root=None,
+    pose_required=False,
     randomize_labels=False,
     random_label_seed=0,
     random_label_mode="permute",
@@ -2522,6 +2813,12 @@ def get_raw_frames_classification_dataloader(
         exclude_classes=exclude_classes,
         min_points_exempt_classes=min_points_exempt_classes,
         forced_classes=forced_classes,
+        frame_selection=frame_selection,
+        object_multi_view=object_multi_view,
+        max_views=max_views,
+        view_selection=view_selection,
+        pose_metadata_root=pose_metadata_root,
+        pose_required=pose_required,
         augment_train=augment_train,
         augment_rotation_deg=augment_rotation_deg,
         augment_scale=augment_scale,

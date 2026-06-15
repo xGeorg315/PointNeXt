@@ -281,6 +281,36 @@ def _log_loader_lengths(prefix, loader):
         logging.info(f"length of {prefix} dataset: {len(loader.dataset)}")
 
 
+def _dataset_class_counts(dataset):
+    counts = {class_name: 0 for class_name in getattr(dataset, "classes", [])}
+    classes = list(getattr(dataset, "classes", []))
+    for sample in getattr(dataset, "samples", []):
+        if isinstance(sample, dict):
+            class_name = sample.get("class_name")
+            if class_name is None and "label" in sample and int(sample["label"]) < len(classes):
+                class_name = classes[int(sample["label"])]
+        elif isinstance(sample, tuple) and len(sample) >= 2 and int(sample[1]) < len(classes):
+            class_name = classes[int(sample[1])]
+        else:
+            class_name = None
+        if class_name is not None:
+            counts[class_name] = counts.get(class_name, 0) + 1
+    return counts
+
+
+def _log_class_sample_overview(loaders):
+    split_counts = {split: _dataset_class_counts(_loader_dataset(loader)) for split, loader in loaders.items()}
+    class_names = sorted({name for counts in split_counts.values() for name in counts})
+    logging.info("Sample overview before training:")
+    logging.info("  class_name | train | val | test | total")
+    for class_name in class_names:
+        train_count = split_counts.get("train", {}).get(class_name, 0)
+        val_count = split_counts.get("val", {}).get(class_name, 0)
+        test_count = split_counts.get("test", {}).get(class_name, 0)
+        total = train_count + val_count + test_count
+        logging.info("  %s | %d | %d | %d | %d", class_name, train_count, val_count, test_count, total)
+
+
 def _build_loaders(cfg):
     custom_root = cfg.get('custom_dataset_root', None)
     if _mixed_classification_mode(cfg):
@@ -345,6 +375,11 @@ def _build_loaders(cfg):
         num_workers = cfg.dataloader.get('num_workers', 4) if cfg.get('dataloader', None) else 4
         val_bs = cfg.get('val_batch_size', cfg.batch_size)
         split_ratios = cfg.get('raw_frames_split_ratios', cfg.get('review_split_ratios', (0.8, 0.1, 0.1)))
+        raw_exclude_classes = cfg.get('raw_frames_exclude_classes', cfg.get('review_exclude_classes', ("reject",)))
+        exclude_classes = list(raw_exclude_classes)
+        for class_name in cfg.get('exclude_classes', ()):
+            if class_name not in exclude_classes:
+                exclude_classes.append(class_name)
         common_kwargs = dict(
             dataset_root=raw_root,
             num_points=cfg.num_points,
@@ -352,7 +387,7 @@ def _build_loaders(cfg):
             start_date=cfg.get('raw_frames_start_date', cfg.get('review_start_date', None)),
             min_points=cfg.get('raw_frames_min_points', cfg.get('review_min_points', 0)),
             split_ratios=split_ratios,
-            exclude_classes=cfg.get('raw_frames_exclude_classes', cfg.get('review_exclude_classes', ("reject",))),
+            exclude_classes=exclude_classes,
             min_points_exempt_classes=cfg.get(
                 'raw_frames_min_points_exempt_classes',
                 cfg.get('review_min_points_exempt_classes', ("TLS_VEHICLE_MOTORBIKE", "TLS_VEHICLE_TRAILER")),
@@ -360,6 +395,12 @@ def _build_loaders(cfg):
             class_balanced_batches=_as_bool(cfg.get('class_balanced_batches', True)),
             balanced_max_repeat_per_sample=cfg.get('balanced_max_repeat_per_sample', None),
             forced_classes=cfg.get('raw_frames_classes', None),
+            frame_selection=cfg.get('raw_frames_frame_selection', cfg.get('frame_selection', 'all')),
+            object_multi_view=_as_bool(cfg.get('raw_frames_object_multi_view', False)),
+            max_views=cfg.get('raw_frames_max_views', 5),
+            view_selection=cfg.get('raw_frames_view_selection', 'uniform'),
+            pose_metadata_root=cfg.get('raw_frames_pose_root', None),
+            pose_required=_as_bool(cfg.get('raw_frames_pose_required', False)),
             **_classification_augmentation_kwargs(cfg),
         )
         train_loader = get_raw_frames_classification_dataloader(
@@ -622,6 +663,94 @@ def _pcd_to_wandb_object3d(points):
     return wandb.Object3D(xyz.numpy())
 
 
+
+def _base_model(model):
+    return model.module if hasattr(model, 'module') else model
+
+
+def _consolidate_observed_points(points, confidence, voxel_size, min_confidence):
+    keep = confidence >= min_confidence
+    points = points[keep]
+    confidence = confidence[keep]
+    if points.numel() == 0:
+        return points.reshape(0, 3)
+    if voxel_size <= 0:
+        return points
+    voxel_keys = torch.floor(points / voxel_size).to(torch.int64)
+    _, inverse = torch.unique(voxel_keys, dim=0, return_inverse=True)
+    representatives = []
+    for voxel_idx in range(int(inverse.max().item()) + 1):
+        candidates = torch.nonzero(inverse == voxel_idx, as_tuple=False).flatten()
+        best = candidates[confidence[candidates].argmax()]
+        representatives.append(points[best])
+    return torch.stack(representatives, dim=0)
+
+
+def _write_ascii_ply(path, points):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    xyz = points.detach().cpu().float().numpy()
+    if xyz.ndim != 2 or xyz.shape[1] < 3:
+        raise ValueError(f"PLY export expects Nx3+ points, got shape {xyz.shape}")
+    xyz = xyz[:, :3]
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write('ply\nformat ascii 1.0\n')
+        handle.write(f'element vertex {len(xyz)}\n')
+        handle.write('property float x\nproperty float y\nproperty float z\nend_header\n')
+        np.savetxt(handle, xyz, fmt='%.7f %.7f %.7f')
+
+
+def _write_raw_frame_exports(base_path, data, batch_idx, valid_views):
+    views = data.get('views')
+    if views is None:
+        return
+    sample_views = views[batch_idx]
+    valid_indices = torch.nonzero(valid_views, as_tuple=False).flatten().tolist()
+    stem, extension = os.path.splitext(base_path)
+    for output_idx, view_idx in enumerate(valid_indices):
+        raw_path = f'{stem}_raw_frame_{output_idx:02d}{extension}'
+        _write_ascii_ply(raw_path, sample_views[view_idx])
+
+
+def _collect_fused_cloud_exports(model, data, epoch, cfg, exported_per_class):
+    if cfg.rank != 0 or not _as_bool(cfg.get('export_fused_clouds', False)):
+        return
+    output = getattr(_base_model(model), 'last_output', None)
+    if not output or 'transformed_points' not in output:
+        return
+    max_per_class = int(cfg.get('fused_clouds_per_class', 2))
+    voxel_size = float(cfg.get('fusion_voxel_size', 0.02))
+    points = output['transformed_points'].detach()
+    confidence = output['point_confidence'].detach()
+    point_mask = output.get('point_mask')
+    view_mask = output['view_mask'].detach()
+    labels = data['y'].detach().cpu()
+    class_names = cfg.get('classes', None)
+    for batch_idx, label in enumerate(labels.tolist()):
+        class_name = _class_name(class_names, label)
+        if exported_per_class.get(class_name, 0) >= max_per_class:
+            continue
+        valid_views = view_mask[batch_idx]
+        valid_points = points[batch_idx][valid_views].reshape(-1, 3)
+        valid_confidence = confidence[batch_idx][valid_views].reshape(-1)
+        if point_mask is not None:
+            selected = point_mask[batch_idx][valid_views].detach().reshape(-1)
+            valid_points = valid_points[selected]
+            valid_confidence = valid_confidence[selected]
+        merged = _consolidate_observed_points(
+            valid_points, valid_confidence, voxel_size, 0.0
+        )
+        sample_idx = exported_per_class.get(class_name, 0)
+        safe_class_name = class_name.replace('/', '_').replace(' ', '_')
+        path = os.path.join(
+            cfg.run_dir, 'fused_clouds', f'epoch_{epoch:04d}',
+            safe_class_name, f'sample_{sample_idx:02d}.ply'
+        )
+        _write_ascii_ply(path, merged)
+        if _as_bool(cfg.get('export_fused_raw_frames', False)):
+            _write_raw_frame_exports(path, data, batch_idx, valid_views)
+        exported_per_class[class_name] = sample_idx + 1
+
+
 def _log_wandb_val_pcds(cfg, epoch, split, samples, wrong_samples):
     if cfg.rank != 0 or not cfg.wandb.use_wandb or wandb.run is None or not _as_bool(cfg.get("wandb_log_pcd_examples", True)):
         return
@@ -866,6 +995,7 @@ def main(gpu, cfg, profile=False):
 
     # build dataset before the model so filtered datasets can set num_classes.
     train_loader, val_loader, test_loader = _build_loaders(cfg)
+    _log_class_sample_overview({"train": train_loader, "val": val_loader, "test": test_loader})
     _log_loader_lengths("validation", val_loader)
     val_dataset = _loader_dataset(val_loader)
     num_classes = val_dataset.num_classes if hasattr(
@@ -1010,6 +1140,11 @@ def main(gpu, cfg, profile=False):
             'best_val': float(best_val),
         }
         wandb_metrics.update(_wandb_per_class_metrics("train", train_accs, cfg))
+        wandb_metrics.update({f'train_loss_{name}': float(value) for name, value in getattr(cfg, '_last_train_aux_losses', {}).items()})
+        wandb_metrics.update({
+            f'train_{name}': float(value)
+            for name, value in getattr(cfg, '_last_train_diagnostics', {}).items()
+        })
         if epoch % cfg.val_freq == 0:
             wandb_metrics.update(_wandb_per_class_metrics("val", val_accs, cfg))
             wandb_metrics.update(_metrics_for_loader_group("val", cfg))
@@ -1090,6 +1225,23 @@ def main(gpu, cfg, profile=False):
 
 def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, cfg):
     loss_meter = AverageMeter()
+    aux_loss_meters = {
+        name: AverageMeter()
+        for name in (
+            'cls', 'reg', 'overlap_point', 'density', 'boundary',
+            'consistency',
+        )
+    }
+    diagnostic_meters = {
+        name: AverageMeter()
+        for name in (
+            'confidence_mean', 'retained_point_ratio',
+            'overlap_positive_ratio', 'rotation_deg_mean',
+            'translation_norm_mean', 'pose_rotation_loss',
+            'pose_translation_loss', 'pose_valid_ratio',
+        )
+    }
+    exported_per_class = {}
     cm = ConfusionMatrix(num_classes=cfg.num_classes)
     npoints = cfg.num_points
 
@@ -1139,6 +1291,15 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, cfg):
             data['pos'] = points[:, :, :3].contiguous()
             data['x'] = points[:, :, :cfg.model.in_channels].transpose(1, 2).contiguous()
         logits, loss = model.get_logits_loss(data, target) if not hasattr(model, 'module') else model.module.get_logits_loss(data, target)
+        model_output = getattr(_base_model(model), 'last_output', None)
+        if model_output and 'losses' in model_output:
+            for loss_name, meter in aux_loss_meters.items():
+                meter.update(float(model_output['losses'][loss_name].detach().item()))
+            for name, meter in diagnostic_meters.items():
+                value = model_output.get('diagnostics', {}).get(name)
+                if value is not None:
+                    meter.update(float(value.detach().item()))
+        _collect_fused_cloud_exports(model, data, epoch, cfg, exported_per_class)
         loss.backward()
 
         # optimize
@@ -1169,6 +1330,10 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, cfg):
         if max_batches is not None and (idx + 1) >= max_batches:
             break
     macc, overallacc, accs = cm.all_acc()
+    cfg._last_train_aux_losses = {name: meter.avg for name, meter in aux_loss_meters.items()}
+    cfg._last_train_diagnostics = {
+        name: meter.avg for name, meter in diagnostic_meters.items()
+    }
     return loss_meter.avg, macc, overallacc, accs, cm
 
 

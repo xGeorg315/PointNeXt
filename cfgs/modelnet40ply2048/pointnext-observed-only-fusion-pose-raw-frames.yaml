@@ -1,0 +1,184 @@
+# Compact multi-view vehicle classifier with 6D pose-supervised registration.
+# Uses five PointNeXt stages and pools the stage-5 point features in
+# MultiViewPointNextCls instead of adding a final GroupAll SA stage.
+# Uses raw-frame-aggregates as pose metadata. final_frame_poses supervise
+# the registration head relative to the selected anchor view.
+# Start:
+# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-observed-only-fusion-pose-raw-frames.yaml
+
+mode: raw_frames_classification
+classification_dataset_format: raw_frames
+raw_frames_root: /home/georg/raw-frames
+raw_frames_object_multi_view: True
+raw_frames_max_views: 5
+raw_frames_view_selection: uniform
+raw_frames_frame_selection: all
+raw_frames_pose_root: /home/georg/raw-frame-aggregates
+raw_frames_pose_required: True
+raw_frames_split_ratios: [0.8, 0.1, 0.1]
+raw_frames_start_date: null
+raw_frames_min_points: 0
+raw_frames_exclude_classes: [reject, TLS_VEHICLE_CAR_WITH_TRAILER, TLS_VEHICLE_TRUCK_WITH_TRAILER, silhouettes_all_axes_10_per_class]
+raw_frames_min_points_exempt_classes: [TLS_VEHICLE_MOTORBIKE, TLS_VEHICLE_TRAILER]
+raw_frames_classes:
+  - TLS_VEHICLE_BUS
+  - TLS_VEHICLE_CAR
+  - TLS_VEHICLE_MOTORBIKE
+  - TLS_VEHICLE_SEMI_TRAILER_TRUCK
+  - TLS_VEHICLE_SMALL_TRUCK
+  - TLS_VEHICLE_TRAILER
+  - TLS_VEHICLE_TRUCK
+  - TLS_VEHICLE_VAN
+  - small construction vehicle
+  - small tow truck
+
+num_points: 1024
+batch_size: 48
+val_batch_size: 48
+class_balanced_batches: False
+balanced_max_repeat_per_sample: 4
+preload_data: True
+augment_train: True
+augment_rotation_deg: 20.0
+augment_scale: [1.0, 1.0]
+augment_jitter_sigma: 0.005
+augment_jitter_clip: 0.02
+augment_dropout: [0.05, 0.2]
+augment_translate: 0.05
+augment_random_points_ratio: 0.0
+use_normals: False
+auto_class_weights: effective_epoch
+auto_class_weight_strategy: inverse_sqrt
+
+epochs: 80
+lr: 0.0001
+sched: cosine
+warmup_epochs: 0
+t_max: 80
+min_lr: 0.0000001
+grad_norm_clip: 1.0
+criterion_args:
+  NAME: SmoothCrossEntropy
+  label_smoothing: 0.05
+
+export_fused_clouds: True
+export_fused_raw_frames: True
+fused_clouds_per_class: 2
+fusion_voxel_size: 0.02
+
+save_local_metrics: True
+wandb_log_confusion_matrices: False
+wandb_log_pcd_examples: False
+wandb_vis_max_samples: 0
+wandb_vis_max_wrong_samples: 0
+
+model:
+  NAME: MultiViewPointNextCls
+  in_channels: 3
+  max_views: 5
+  # The five-stage encoder already outputs 256 channels, so feature_projection
+  # becomes Identity instead of expanding a 256D representation to 512D.
+  feature_dim: 256
+  view_fusion: none
+  view_pooling: gated_weight
+  attention_num_heads: 8
+  attention_dropout: 0.1
+  point_hidden_dim: 128
+  registration_hidden_dim: 128
+  feature_projection_args:
+    mlps: []
+    dropout: 0.0
+    activate_last: False
+  # Raw-frame views stay in their observed coordinate systems. Disabling this
+  # head removes its parameters and returns identity transforms directly. To
+  # enable registration, set this to True, restore transform limits below, and
+  # use a positive lambda_reg.
+  enable_registration_head: true
+  registration_head_args:
+    mlps: [256, 128, 64]
+    dropout: 0.0
+    activate_last: False
+  # Share the first pointwise projection between confidence prediction and
+  # observed-point encoding: 259 -> 128, then branch to 1 and 256 channels.
+  shared_point_stem_dim: 128
+  shared_point_stem_args:
+    mlps: []
+    dropout: 0.0
+    activate_last: True
+  confidence_head_args:
+    mlps: []
+    dropout: 0.0
+    activate_last: False
+  boundary_head_args:
+    mlps: [128]
+    dropout: 0.0
+    activate_last: False
+  observed_point_encoder_args:
+    mlps: []
+    dropout: 0.0
+    activate_last: True
+  # Linear 512 -> 256 fusion without a final ReLU.
+  fusion_projection_args:
+    mlps: []
+    dropout: 0.0
+    activate_last: False
+  max_rotation_deg: 45.0
+  max_translation: 1.5
+  alignment_points: 128
+  fusion_voxel_size: 0.02
+  overlap_sigma: 0.1
+  overlap_distance: 0.1
+  confidence_threshold: 0.05
+  soft_fusion_during_training: True
+  fusion_gate_temperature: 0.02
+  registration_geometry_only: True
+  registration_loss_mode: pose
+  pose_rotation_weight: 1.0
+  pose_translation_weight: 1.0
+  pose_loss_beta: 0.05
+  pose_max_translation: 1.5
+  pose_max_rotation_deg: 30.0
+  enable_boundary_head: False
+  boundary_k: 16
+  boundary_curvature_threshold: 0.08
+  boundary_pos_weight: auto
+  boundary_pos_weight_max: 8.0
+  boundary_label_smoothing: 0.05
+  lambda_cls: 0.8
+  lambda_reg: 0.5
+  lambda_overlap_point: 0.5
+  lambda_consistency: 0.3
+  lambda_density: 0.0
+  lambda_boundary: 0.0
+  extra_global_channels: 0
+  encoder_args:
+    NAME: PointNextEncoder
+    blocks: [1, 1, 1, 1, 1]
+    strides: [1, 2, 2, 2, 2]
+    width: 32
+    in_channels: 3
+    radius: 0.15
+    radius_scaling: 1.5
+    sa_layers: 2
+    sa_use_res: True
+    nsample: 32
+    expansion: 4
+    aggr_args:
+      feature_type: dp_fj
+      reduction: max
+    group_args:
+      NAME: ballquery
+      normalize_dp: True
+    conv_args:
+      order: conv-norm-act
+    act_args:
+      act: relu
+    norm_args:
+      norm: bn
+  cls_args:
+    NAME: ClsHead
+    num_classes: 10
+    mlps: [128]
+    dropout: 0.3
+    norm_args:
+      norm: bn1d

@@ -8,7 +8,9 @@ slurm*
 .vscode/
 dcgm/
 .DS_Store
-
+boundary_label_audit/
+boundary_label_methods_audit/
+exports/
 # Byte-compiled / optimized / DLL files
 .idea/
 __pycache__/
