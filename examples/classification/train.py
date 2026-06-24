@@ -699,6 +699,92 @@ def _write_ascii_ply(path, points):
         np.savetxt(handle, xyz, fmt='%.7f %.7f %.7f')
 
 
+
+def _confidence_to_rgb(confidence, kept):
+    conf = confidence.detach().cpu().float().clamp(0.0, 1.0).numpy()
+    keep = kept.detach().cpu().bool().numpy()
+    rgb = np.zeros((conf.shape[0], 3), dtype=np.uint8)
+    rgb[:, 0] = np.round(255.0 * (1.0 - conf)).astype(np.uint8)
+    rgb[:, 1] = np.round(255.0 * conf).astype(np.uint8)
+    rgb[:, 2] = 32
+    rgb[~keep] = np.array([255, 32, 32], dtype=np.uint8)
+    return rgb
+
+
+def _write_confidence_ply(path, points, confidence, kept):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    xyz = points.detach().cpu().float().numpy()
+    conf = confidence.detach().cpu().float().clamp(0.0, 1.0).numpy()
+    keep = kept.detach().cpu().bool().numpy()
+    if xyz.ndim != 2 or xyz.shape[1] < 3:
+        raise ValueError(f"PLY export expects Nx3+ points, got shape {xyz.shape}")
+    if xyz.shape[0] != conf.shape[0] or xyz.shape[0] != keep.shape[0]:
+        raise ValueError(
+            "points, confidence and kept mask must have equal length, "
+            f"got {xyz.shape[0]}, {conf.shape[0]}, {keep.shape[0]}"
+        )
+    xyz = xyz[:, :3]
+    rgb = _confidence_to_rgb(confidence, kept)
+    header = [
+        "ply",
+        "format ascii 1.0",
+        f"element vertex {len(xyz)}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property uchar red",
+        "property uchar green",
+        "property uchar blue",
+        "property float confidence",
+        "property uchar kept",
+        "end_header",
+    ]
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write("\n".join(header) + "\n")
+        for point, color, value, is_kept in zip(xyz, rgb, conf, keep):
+            handle.write(
+                f'{point[0]:.7f} {point[1]:.7f} {point[2]:.7f} '
+                f'{int(color[0])} {int(color[1])} {int(color[2])} '
+                f'{float(value):.6f} {int(is_kept)}\n'
+            )
+
+
+
+def _write_confidence_histogram(path, confidence, kept, threshold=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conf = confidence.detach().cpu().float().clamp(0.0, 1.0).numpy()
+    keep = kept.detach().cpu().bool().numpy()
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        logging.warning("Skipping confidence histogram export: matplotlib import failed (%s).", e)
+        return
+
+    bins = np.linspace(0.0, 1.0, 21)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(conf, bins=bins, color="#4c9f70", edgecolor="#1f2933", alpha=0.85)
+    if conf.size:
+        mean = float(conf.mean())
+        median = float(np.median(conf))
+        ax.axvline(mean, color="#1f4e79", linewidth=2, label=f"mean {mean:.3f}")
+        ax.axvline(median, color="#805ad5", linewidth=1.5, linestyle="--", label=f"median {median:.3f}")
+    if threshold is not None:
+        ax.axvline(float(threshold), color="#d62728", linewidth=2, linestyle=":", label=f"threshold {float(threshold):.3f}")
+    rejected = int((~keep).sum())
+    total = int(keep.shape[0])
+    ax.set_title(f"Point confidence distribution ({rejected}/{total} rejected)")
+    ax.set_xlabel("confidence")
+    ax.set_ylabel("points")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xticks(np.linspace(0.0, 1.0, 11))
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
 def _write_raw_frame_exports(base_path, data, batch_idx, valid_views):
     views = data.get('views')
     if views is None:
@@ -720,8 +806,16 @@ def _collect_fused_cloud_exports(model, data, epoch, cfg, exported_per_class):
     max_per_class = int(cfg.get('fused_clouds_per_class', 2))
     voxel_size = float(cfg.get('fusion_voxel_size', 0.02))
     points = output['transformed_points'].detach()
+    pre_icp_points = output.get('pre_icp_points')
+    if pre_icp_points is not None:
+        pre_icp_points = pre_icp_points.detach()
+    pre_residual_points = output.get('pre_residual_points')
+    if pre_residual_points is not None:
+        pre_residual_points = pre_residual_points.detach()
     confidence = output['point_confidence'].detach()
     point_mask = output.get('point_mask')
+    if point_mask is not None:
+        point_mask = point_mask.detach()
     view_mask = output['view_mask'].detach()
     labels = data['y'].detach().cpu()
     class_names = cfg.get('classes', None)
@@ -730,12 +824,14 @@ def _collect_fused_cloud_exports(model, data, epoch, cfg, exported_per_class):
         if exported_per_class.get(class_name, 0) >= max_per_class:
             continue
         valid_views = view_mask[batch_idx]
-        valid_points = points[batch_idx][valid_views].reshape(-1, 3)
-        valid_confidence = confidence[batch_idx][valid_views].reshape(-1)
+        all_points = points[batch_idx][valid_views].reshape(-1, 3)
+        all_confidence = confidence[batch_idx][valid_views].reshape(-1)
         if point_mask is not None:
-            selected = point_mask[batch_idx][valid_views].detach().reshape(-1)
-            valid_points = valid_points[selected]
-            valid_confidence = valid_confidence[selected]
+            selected = point_mask[batch_idx][valid_views].reshape(-1)
+        else:
+            selected = torch.ones_like(all_confidence, dtype=torch.bool)
+        valid_points = all_points[selected]
+        valid_confidence = all_confidence[selected]
         merged = _consolidate_observed_points(
             valid_points, valid_confidence, voxel_size, 0.0
         )
@@ -746,6 +842,49 @@ def _collect_fused_cloud_exports(model, data, epoch, cfg, exported_per_class):
             safe_class_name, f'sample_{sample_idx:02d}.ply'
         )
         _write_ascii_ply(path, merged)
+        if (
+            pre_icp_points is not None
+            and _as_bool(cfg.get('export_pre_icp_clouds', False))
+        ):
+            pre_icp_all_points = pre_icp_points[batch_idx][
+                valid_views
+            ].reshape(-1, 3)
+            pre_icp_merged = _consolidate_observed_points(
+                pre_icp_all_points[selected], valid_confidence,
+                voxel_size, 0.0,
+            )
+            stem, extension = os.path.splitext(path)
+            _write_ascii_ply(
+                f'{stem}_pre_icp{extension}', pre_icp_merged
+            )
+        if (
+            pre_residual_points is not None
+            and _as_bool(cfg.get('export_pre_residual_clouds', False))
+        ):
+            pre_residual_all_points = pre_residual_points[batch_idx][
+                valid_views
+            ].reshape(-1, 3)
+            pre_residual_merged = _consolidate_observed_points(
+                pre_residual_all_points[selected], valid_confidence,
+                voxel_size, 0.0,
+            )
+            stem, extension = os.path.splitext(path)
+            _write_ascii_ply(
+                f'{stem}_pre_residual{extension}', pre_residual_merged
+            )
+        if _as_bool(cfg.get('export_fused_confidence_clouds', cfg.get('export_confidence_clouds', False))):
+            stem, extension = os.path.splitext(path)
+            confidence_path = f'{stem}_confidence{extension}'
+            _write_confidence_ply(
+                confidence_path, all_points, all_confidence, selected
+            )
+            if _as_bool(cfg.get('export_fused_confidence_histograms', True)):
+                threshold = None
+                if cfg.get('model', None) is not None:
+                    threshold = cfg.model.get('confidence_threshold', None)
+                _write_confidence_histogram(
+                    f'{stem}_confidence_hist.png', all_confidence, selected, threshold
+                )
         if _as_bool(cfg.get('export_fused_raw_frames', False)):
             _write_raw_frame_exports(path, data, batch_idx, valid_views)
         exported_per_class[class_name] = sample_idx + 1
@@ -1228,8 +1367,9 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, cfg):
     aux_loss_meters = {
         name: AverageMeter()
         for name in (
-            'cls', 'reg', 'overlap_point', 'density', 'boundary',
-            'consistency',
+            'cls', 'align', 'icp_delta_reg', 'reg', 'overlap_point',
+            'residual_correction', 'density', 'boundary', 'consistency',
+            'cls_weighted', 'reg_weighted', 'residual_correction_weighted',
         )
     }
     diagnostic_meters = {
@@ -1237,7 +1377,9 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, cfg):
         for name in (
             'confidence_mean', 'retained_point_ratio',
             'overlap_positive_ratio', 'rotation_deg_mean',
-            'translation_norm_mean', 'pose_rotation_loss',
+            'translation_norm_mean', 'icp_delta_translation_norm_mean',
+            'residual_delta_translation_norm_mean',
+            'pose_rotation_loss',
             'pose_translation_loss', 'pose_valid_ratio',
         )
     }

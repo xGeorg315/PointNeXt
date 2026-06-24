@@ -1,0 +1,193 @@
+# Minimal multi-view classifier: PointNeXt encoder, registration head with
+# differentiable y-translation-only point-to-plane ICP, and classification
+# head. Views are pooled by a parameter-free masked mean; no learned fusion modules are constructed.
+# Start:
+# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-differentiable-icp-lightweight.yaml
+
+mode: raw_frames_classification
+classification_dataset_format: raw_frames
+raw_frames_root: /home/georg/raw-frames
+raw_frames_object_multi_view: True
+raw_frames_max_views: 5
+raw_frames_view_selection: uniform
+raw_frames_frame_selection: all
+raw_frames_pose_root: /home/georg/raw-frame-aggregates
+raw_frames_pose_required: True
+raw_frames_split_ratios: [0.8, 0.1, 0.1]
+raw_frames_start_date: null
+raw_frames_min_points: 0
+raw_frames_exclude_classes: [reject, TLS_VEHICLE_CAR_WITH_TRAILER, TLS_VEHICLE_TRUCK_WITH_TRAILER, silhouettes_all_axes_10_per_class]
+raw_frames_min_points_exempt_classes: [TLS_VEHICLE_MOTORBIKE, TLS_VEHICLE_TRAILER]
+raw_frames_classes:
+  - TLS_VEHICLE_BUS
+  - TLS_VEHICLE_CAR
+  - TLS_VEHICLE_MOTORBIKE
+  - TLS_VEHICLE_SEMI_TRAILER_TRUCK
+  - TLS_VEHICLE_SMALL_TRUCK
+  - TLS_VEHICLE_TRAILER
+  - TLS_VEHICLE_TRUCK
+  - TLS_VEHICLE_VAN
+  - small construction vehicle
+  - small tow truck
+
+num_points: 512
+batch_size: 36
+val_batch_size: 36
+class_balanced_batches: False
+balanced_max_repeat_per_sample: 4
+preload_data: True
+augment_train: True
+augment_rotation_deg: 20.0
+augment_scale: [1.0, 1.0]
+augment_jitter_sigma: 0.005
+augment_jitter_clip: 0.02
+augment_dropout: [0.05, 0.2]
+augment_translate: 0.05
+augment_random_points_ratio: 0.0
+use_normals: false
+normal_k: 24
+auto_class_weights: effective_epoch
+auto_class_weight_strategy: inverse_sqrt
+
+epochs: 80
+lr: 0.0001
+sched: cosine
+warmup_epochs: 0
+t_max: 80
+min_lr: 0.0000001
+grad_norm_clip: 1.0
+criterion_args:
+  NAME: SmoothCrossEntropy
+  label_smoothing: 0.05
+
+export_fused_clouds: True
+export_pre_icp_clouds: True
+export_fused_raw_frames: True
+fused_clouds_per_class: 2
+fusion_voxel_size: 0.00
+
+save_local_metrics: True
+wandb_log_confusion_matrices: False
+wandb_log_pcd_examples: False
+wandb_vis_max_samples: 0
+wandb_vis_max_wrong_samples: 0
+
+model:
+  NAME: MultiViewPointNextCls
+  max_views: 5
+
+  # Trainable blocks: encoder, feature projection, registration head, cls head.
+  # Multi-view descriptors are combined by a parameter-free masked mean.
+  minimal_architecture: true
+
+  # Reduced from 256 to 192.
+  # This keeps enough descriptor capacity for 10 classes while reducing the
+  # classifier and projection cost.
+  feature_dim: 192
+
+  global_pooling: max_mean
+
+  feature_projection_args:
+    mlps: []
+    dropout: 0.0
+    activate_last: true
+
+  view_fusion: none
+
+  # Learned coarse pose followed by point-to-plane ICP that may only apply a
+  # small translation along y; ICP rotation and x/z translation stay zero.
+  enable_registration_head: true
+  registration_hidden_dim: 128
+  registration_head_args:
+    mlps: [512, 256, 128]
+    dropout: 0.1
+    activate_last: false
+
+  max_rotation_deg: 45.0
+  max_translation: 1.5
+  registration_refinement_steps: 1
+  enable_icp_refinement: true
+  icp_iterations: 5
+  icp_points: 128
+  icp_max_correspondence_distance: 0.25
+  icp_normal_k: 16
+  icp_damping: 0.0001
+  icp_huber_delta: 0.02
+  icp_max_y_translation_step: 0.02
+  icp_convergence_tolerance: 0.0005
+  icp_convergence_patience: 2
+  icp_min_iterations: 1
+
+  # L = lambda_cls * L_cls + lambda_align * L_align(T_net then T_icp)
+  #     + lambda_icp_delta_reg * ||delta_t_icp||^2
+  lambda_cls: 0.8
+  lambda_align: 1.0
+  lambda_icp_delta_reg: 1.0
+  lambda_reg: 0.0
+  lambda_overlap_point: 0.0
+  lambda_density: 0.0
+  lambda_boundary: 0.0
+  lambda_consistency: 0.0
+  lambda_occlusion_depth: 0.0
+  extra_global_channels: 0
+
+  encoder_args:
+    NAME: PointNextEncoder
+
+    # Kept unchanged. Do not reduce stages yet; this is safer for preserving
+    # global shape abstraction.
+    blocks: [1, 1, 1, 1, 1]
+    strides: [1, 2, 2, 2, 2]
+
+    # Kept at 16. Reducing width is riskier than reducing local neighborhood
+    # work.
+    width: 16
+
+    in_channels: 3
+
+    # Kept unchanged to avoid shrinking both neighborhood radius and sample
+    # count at the same time.
+    radius: 0.15
+    radius_scaling: 1.5
+
+    # Reduced from 2 to 1.
+    # This makes each set-abstraction stage cheaper.
+    sa_layers: 1
+
+    sa_use_res: True
+
+    # Reduced from 32 to 24.
+    # This is usually the safest first compute reduction for PointNeXt.
+    nsample: 24
+
+    expansion: 4
+
+    aggr_args:
+      feature_type: dp_fj
+      reduction: max
+
+    group_args:
+      NAME: ballquery
+      normalize_dp: True
+
+    conv_args:
+      order: conv-norm-act
+
+    act_args:
+      act: relu
+
+    norm_args:
+      norm: bn
+
+  cls_args:
+    NAME: ClsHead
+    num_classes: 10
+
+    # Matched to feature_dim: 192.
+    # Reduced from [256, 256, 128].
+    mlps: [192, 192, 128]
+
+    dropout: 0.3
+
+    norm_args:
+      norm: bn1d

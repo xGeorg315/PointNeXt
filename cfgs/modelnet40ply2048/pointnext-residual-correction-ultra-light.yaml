@@ -1,10 +1,10 @@
-# Compact multi-view vehicle classifier with 6D pose-supervised registration.
-# Uses five PointNeXt stages and pools the stage-5 point features in
-# MultiViewPointNextCls instead of adding a final GroupAll SA stage.
-# Uses raw-frame-aggregates as pose metadata. final_frame_poses supervise
-# the registration head relative to the selected anchor view.
+# Ultra-light minimal multi-view classifier: reduced PointNeXt encoder, coarse
+# registration head, learned y-translation residual correction head trained
+# against a five-step point-to-plane ICP teacher, and classification head.
+# Views are pooled by a parameter-free masked mean; no learned fusion modules
+# are constructed.
 # Start:
-# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-observed-only-fusion-pose-raw-frames.yaml
+# python examples/classification/main.py --cfg cfgs/modelnet40ply2048/pointnext-residual-correction-ultra-light.yaml
 
 mode: raw_frames_classification
 classification_dataset_format: raw_frames
@@ -32,9 +32,9 @@ raw_frames_classes:
   - small construction vehicle
   - small tow truck
 
-num_points: 1024
-batch_size: 48
-val_batch_size: 48
+num_points: 512
+batch_size: 36
+val_batch_size: 36
 class_balanced_batches: False
 balanced_max_repeat_per_sample: 4
 preload_data: True
@@ -46,7 +46,8 @@ augment_jitter_clip: 0.02
 augment_dropout: [0.05, 0.2]
 augment_translate: 0.05
 augment_random_points_ratio: 0.0
-use_normals: False
+use_normals: false
+normal_k: 24
 auto_class_weights: effective_epoch
 auto_class_weight_strategy: inverse_sqrt
 
@@ -62,9 +63,11 @@ criterion_args:
   label_smoothing: 0.05
 
 export_fused_clouds: True
+export_pre_icp_clouds: False
+export_pre_residual_clouds: True
 export_fused_raw_frames: True
 fused_clouds_per_class: 2
-fusion_voxel_size: 0.0
+fusion_voxel_size: 0.00
 
 save_local_metrics: True
 wandb_log_confusion_matrices: False
@@ -74,97 +77,85 @@ wandb_vis_max_wrong_samples: 0
 
 model:
   NAME: MultiViewPointNextCls
-  in_channels: 3
   max_views: 5
-  # The five-stage encoder already outputs 256 channels, so feature_projection
-  # becomes Identity instead of expanding a 256D representation to 512D.
-  feature_dim: 256
-  view_fusion: none
-  view_pooling: gated_weight
-  attention_num_heads: 8
-  attention_dropout: 0.1
-  point_hidden_dim: 128
-  registration_hidden_dim: 128
+
+  # Trainable blocks: encoder, feature projection, pose/residual heads, cls head.
+  # Multi-view descriptors are combined by a parameter-free masked mean.
+  minimal_architecture: true
+  feature_dim: 192
+  global_pooling: max_mean
   feature_projection_args:
     mlps: []
     dropout: 0.0
-    activate_last: False
-  # Raw-frame views stay in their observed coordinate systems. Disabling this
-  # head removes its parameters and returns identity transforms directly. To
-  # enable registration, set this to True, restore transform limits below, and
-  # use a positive lambda_reg.
+    activate_last: true
+  view_fusion: none
+
+  # Learned coarse pose followed by a learned residual correction. During
+  # training, five point-to-plane ICP steps are run from the coarse pose and
+  # their detached y-translation delta is the residual block's target.
   enable_registration_head: true
+  registration_hidden_dim: 128
   registration_head_args:
-    mlps: [256, 128, 64]
-    dropout: 0.0
-    activate_last: False
-  # Share the first pointwise projection between confidence prediction and
-  # observed-point encoding: 259 -> 128, then branch to 1 and 256 channels.
-  shared_point_stem_dim: 128
-  shared_point_stem_args:
-    mlps: []
-    dropout: 0.0
-    activate_last: True
-  confidence_head_args:
-    mlps: []
-    dropout: 0.0
-    activate_last: False
-  boundary_head_args:
-    mlps: [128]
-    dropout: 0.0
-    activate_last: False
-  observed_point_encoder_args:
-    mlps: []
-    dropout: 0.0
-    activate_last: True
-  # Linear 512 -> 256 fusion without a final ReLU.
-  fusion_projection_args:
-    mlps: []
-    dropout: 0.0
-    activate_last: False
+    mlps: [512, 256, 128]
+    dropout: 0.1
+    activate_last: false
   max_rotation_deg: 45.0
   max_translation: 1.5
-  alignment_points: 128
-  fusion_voxel_size: 0.02
-  overlap_sigma: 0.1
-  overlap_distance: 0.1
-  confidence_threshold: 0.05
-  soft_fusion_during_training: True
-  fusion_gate_temperature: 0.02
-  registration_geometry_only: True
+  registration_refinement_steps: 1
+  enable_icp_refinement: false
+  icp_iterations: 5
+  icp_points: 128
+  icp_max_correspondence_distance: 0.25
+  icp_normal_k: 16
+  icp_damping: 0.0001
+  icp_huber_delta: 0.02
+  icp_max_y_translation_step: 0.02
+  enable_residual_correction_head: true
+  residual_reencode_after_coarse: true
+  residual_correction_hidden_dim: 128
+  residual_correction_head_args:
+    mlps: [512, 256, 128]
+    dropout: 0.1
+    activate_last: false
+  residual_max_translation: 1.0
+  residual_translation_axes: y
+  residual_correction_target: icp
+  residual_loss_beta: 0.02
   registration_loss_mode: pose
   pose_rotation_weight: 1.0
   pose_translation_weight: 1.0
-  pose_loss_beta: 0.05
+  pose_loss_beta: 0.005
   pose_max_translation: 1.5
   pose_max_rotation_deg: 30.0
-  enable_boundary_head: False
-  boundary_k: 16
-  boundary_curvature_threshold: 0.08
-  boundary_pos_weight: auto
-  boundary_pos_weight_max: 8.0
-  boundary_label_smoothing: 0.05
-  lambda_cls: 0.8
-  lambda_reg: 0.5
-  lambda_overlap_point: 0.5
-  lambda_occlusion_depth: 0.2
-  occlusion_ray_distance: 0.08
-  occlusion_depth_margin: 0.08
-  lambda_consistency: 0.8
+  # Supervise the registration head before the learned residual correction.
+  pose_loss_on_coarse: true
+
+  # L = lambda_cls * L_cls + lambda_reg * L_pose(T_coarse)
+  #     + lambda_align * L_align(T_coarse + dt)
+  #     + lambda_residual_correction * smooth_l1(dt, dt_icp(coarse).detach())
+  lambda_cls: 0.2
+  lambda_align: 0.0
+  lambda_icp_delta_reg: 0.0
+  lambda_residual_correction: 20.0
+  lambda_reg: 20.0
+  lambda_overlap_point: 0.0
   lambda_density: 0.0
   lambda_boundary: 0.0
+  lambda_consistency: 0.0
+  lambda_occlusion_depth: 0.0
   extra_global_channels: 0
+
   encoder_args:
     NAME: PointNextEncoder
     blocks: [1, 1, 1, 1, 1]
     strides: [1, 2, 2, 2, 2]
-    width: 32
+    width: 16
     in_channels: 3
     radius: 0.15
     radius_scaling: 1.5
-    sa_layers: 2
+    sa_layers: 1
     sa_use_res: True
-    nsample: 32
+    nsample: 24
     expansion: 4
     aggr_args:
       feature_type: dp_fj
@@ -178,10 +169,11 @@ model:
       act: relu
     norm_args:
       norm: bn
+
   cls_args:
     NAME: ClsHead
     num_classes: 10
-    mlps: [256, 128, 64]
+    mlps: [192, 192, 128]
     dropout: 0.3
     norm_args:
       norm: bn1d

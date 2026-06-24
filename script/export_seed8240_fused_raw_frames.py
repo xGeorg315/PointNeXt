@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Export fused raw-frame clouds for the seed 8240 PointNeXt run.
+"""Export fused raw-frame clouds for an arbitrary PointNeXt run.
 
 Examples:
-  python script/export_seed8240_fused_raw_frames.py --confidence-head on
-  python script/export_seed8240_fused_raw_frames.py --confidence-head off
-  python script/export_seed8240_fused_raw_frames.py --checkpoint /path/to/ckpt.pth
+  python script/export_seed8240_fused_raw_frames.py --seed 8240
+  python script/export_seed8240_fused_raw_frames.py --seed 42 --cfg cfgs/my-config.yaml
+  python script/export_seed8240_fused_raw_frames.py --cfg cfgs/my-config.yaml --checkpoint /path/to/ckpt.pth
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ from openpoints.utils import EasyConfig, load_checkpoint, set_random_seed  # noq
 
 
 DEFAULT_CFG = POINTNEXT_ROOT / "cfgs/modelnet40ply2048/pointnext-observed-only-fusion-pose-raw-frames.yaml"
-DEFAULT_DATASET_ROOT = Path("/home/georg/raw-frames")
-DEFAULT_OUTPUT_ROOT = POINTNEXT_ROOT / "exports/seed8240_fused_raw_frames"
+DEFAULT_SEED = 8240
+DEFAULT_CHECKPOINT_SEARCH_ROOT = POINTNEXT_ROOT / "log"
 DEFAULT_CLASSES = (
     "TLS_VEHICLE_BUS",
     "TLS_VEHICLE_CAR",
@@ -49,17 +49,33 @@ DEFAULT_CLASSES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Exportiere fused clouds aus raw-frames mit PointNeXt seed 8240."
+        description="Exportiere fused clouds aus einem beliebigen PointNeXt-Raw-Frames-Lauf."
     )
-    parser.add_argument("--cfg", type=Path, default=DEFAULT_CFG)
-    parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--cfg", type=Path, default=DEFAULT_CFG, help="Pfad zur Trainings-Config.")
+    parser.add_argument(
+        "--dataset-root", type=Path, default=None,
+        help="Optionaler Override; standardmaessig wird raw_frames_root aus der Config verwendet.",
+    )
+    parser.add_argument(
+        "--output-root", type=Path, default=None,
+        help="Standard: exports/<config-name>_seed<seed>_fused_raw_frames.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--run-dir", type=Path, default=None, help="Optional: Run-Verzeichnis mit checkpoint/*_ckpt_best.pth.")
+    parser.add_argument(
+        "--checkpoint-search-root", type=Path, default=DEFAULT_CHECKPOINT_SEARCH_ROOT,
+        help="Wurzel fuer die automatische rekursive Checkpoint-Suche (Standard: log/).",
+    )
     parser.add_argument("--split", default="test", choices=("train", "val", "test"))
-    parser.add_argument("--seed", type=int, default=8240)
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help=f"Seed-Override; sonst Config-Wert, danach Fallback {DEFAULT_SEED}.",
+    )
     parser.add_argument("--per-class", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Optionaler Override; sonst val_batch_size/batch_size aus der Config.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=("auto", "cuda", "cpu"))
     parser.add_argument("--confidence-head", default="cfg", choices=("cfg", "on", "off"))
@@ -156,6 +172,52 @@ def write_ascii_ply(path: str | Path, points: torch.Tensor) -> None:
         np.savetxt(handle, xyz, fmt="%.7f %.7f %.7f")
 
 
+
+def confidence_to_rgb(confidence: torch.Tensor, kept: torch.Tensor) -> np.ndarray:
+    conf = confidence.detach().cpu().float().clamp(0.0, 1.0).numpy()
+    keep = kept.detach().cpu().bool().numpy()
+    rgb = np.zeros((conf.shape[0], 3), dtype=np.uint8)
+    rgb[:, 0] = np.round(255.0 * (1.0 - conf)).astype(np.uint8)
+    rgb[:, 1] = np.round(255.0 * conf).astype(np.uint8)
+    rgb[:, 2] = 32
+    rgb[~keep] = np.array([255, 32, 32], dtype=np.uint8)
+    return rgb
+
+
+def write_confidence_ply(
+    path: str | Path,
+    points: torch.Tensor,
+    confidence: torch.Tensor,
+    kept: torch.Tensor,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    xyz = points.detach().cpu().float().numpy()
+    conf = confidence.detach().cpu().float().clamp(0.0, 1.0).numpy()
+    keep = kept.detach().cpu().bool().numpy()
+    if xyz.ndim != 2 or xyz.shape[1] < 3:
+        raise ValueError(f"PLY export expects Nx3+ points, got shape {xyz.shape}")
+    if xyz.shape[0] != conf.shape[0] or xyz.shape[0] != keep.shape[0]:
+        raise ValueError(
+            "points, confidence and kept mask must have equal length, "
+            f"got {xyz.shape[0]}, {conf.shape[0]}, {keep.shape[0]}"
+        )
+    xyz = xyz[:, :3]
+    rgb = confidence_to_rgb(confidence, kept)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("ply\nformat ascii 1.0\n")
+        handle.write(f"element vertex {len(xyz)}\n")
+        handle.write("property float x\nproperty float y\nproperty float z\n")
+        handle.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        handle.write("property float confidence\nproperty uchar kept\nend_header\n")
+        for point, color, value, is_kept in zip(xyz, rgb, conf, keep):
+            handle.write(
+                f"{point[0]:.7f} {point[1]:.7f} {point[2]:.7f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])} "
+                f"{float(value):.6f} {int(is_kept)}\n"
+            )
+
+
 def find_checkpoint(args: argparse.Namespace) -> Path | None:
     if args.skip_checkpoint:
         return None
@@ -167,29 +229,58 @@ def find_checkpoint(args: argparse.Namespace) -> Path | None:
             raise FileNotFoundError(f"Kein *_ckpt_best.pth unter {args.run_dir / 'checkpoint'} gefunden.")
         return matches[0].resolve()
 
-    log_root = POINTNEXT_ROOT / "log/modelnet40ply2048"
-    matches = sorted(log_root.glob(f"*seed{args.seed}*/checkpoint/*_ckpt_best.pth"))
+    search_root = args.checkpoint_search_root.expanduser().resolve()
+    matches = sorted(search_root.rglob(f"*seed{args.seed}*/checkpoint/*_ckpt_best.pth"))
     if not matches:
         raise FileNotFoundError(
-            "Kein seed-8240 Checkpoint automatisch gefunden. Bitte --checkpoint oder --run-dir angeben "
-            "oder fuer einen reinen Smoke-Test --skip-checkpoint nutzen."
+            f"Kein Checkpoint fuer Seed {args.seed} unter {search_root} gefunden. "
+            "Bitte --checkpoint, --run-dir oder --checkpoint-search-root angeben oder fuer einen "
+            "reinen Smoke-Test --skip-checkpoint nutzen."
         )
-    return matches[-1].resolve()
+
+    cfg_name = args.cfg.stem.lower()
+    matching_cfg = [path for path in matches if cfg_name in str(path).lower()]
+    candidates = matching_cfg or matches
+    if len(candidates) > 1:
+        logging.warning(
+            "Mehrere Checkpoints passen zu Seed %s; verwende %s. "
+            "Fuer eine eindeutige Auswahl --checkpoint angeben.",
+            args.seed,
+            candidates[-1],
+        )
+    return candidates[-1].resolve()
 
 
 def load_cfg(args: argparse.Namespace) -> EasyConfig:
     cfg = EasyConfig()
+    args.cfg = args.cfg.expanduser().resolve()
+    if not args.cfg.is_file():
+        raise FileNotFoundError(f"Config nicht gefunden: {args.cfg}")
     cfg.load(str(args.cfg), recursive=True)
-    cfg.seed = int(args.seed)
+
+    args.seed = int(args.seed if args.seed is not None else cfg.get("seed", DEFAULT_SEED))
+    cfg.seed = args.seed
     cfg.rank = 0
     cfg.world_size = 1
     cfg.distributed = False
     cfg.mp = False
     cfg.sync_bn = False
+    configured_dataset_root = cfg.get("raw_frames_root", cfg.get("custom_dataset_root", None))
+    if args.dataset_root is None and configured_dataset_root is None:
+        raise ValueError(
+            "Die Config enthaelt weder raw_frames_root noch custom_dataset_root; "
+            "bitte --dataset-root angeben."
+        )
+    args.dataset_root = Path(args.dataset_root or configured_dataset_root).expanduser().resolve()
     cfg.raw_frames_root = str(args.dataset_root)
     cfg.custom_dataset_root = str(args.dataset_root)
-    cfg.batch_size = int(args.batch_size)
-    cfg.val_batch_size = int(args.batch_size)
+
+    args.batch_size = int(
+        args.batch_size if args.batch_size is not None
+        else cfg.get("val_batch_size", cfg.get("batch_size", 16))
+    )
+    cfg.batch_size = args.batch_size
+    cfg.val_batch_size = args.batch_size
     cfg.preload_data = bool(args.preload_data)
     cfg.augment_train = False
     cfg.raw_frames_object_multi_view = True
@@ -210,6 +301,17 @@ def load_cfg(args: argparse.Namespace) -> EasyConfig:
     cfg.model.cls_args.num_classes = cfg.num_classes
     configure_point_feature_channels(cfg)
     return cfg
+
+
+def configure_output_root(args: argparse.Namespace) -> None:
+    if args.output_root is None:
+        args.output_root = (
+            POINTNEXT_ROOT
+            / "exports"
+            / f"{safe_name(args.cfg.stem)}_seed{args.seed}_fused_raw_frames"
+        )
+    else:
+        args.output_root = args.output_root.expanduser().resolve()
 
 
 def build_dataset(cfg: EasyConfig, split: str) -> RawFramesClassificationDataset:
@@ -291,6 +393,8 @@ def export_batch(
     points = output["transformed_points"].detach()
     confidence = output["point_confidence"].detach()
     point_mask = output.get("point_mask")
+    if point_mask is not None:
+        point_mask = point_mask.detach()
     view_mask = output["view_mask"].detach()
     labels = data["y"].detach().cpu().tolist()
     voxel_size = float(cfg.model.get("fusion_voxel_size", cfg.get("fusion_voxel_size", 0.02)))
@@ -305,12 +409,14 @@ def export_batch(
             continue
 
         valid_views = view_mask[batch_idx]
-        valid_points = points[batch_idx][valid_views].reshape(-1, 3)
-        valid_confidence = confidence[batch_idx][valid_views].reshape(-1)
+        all_points = points[batch_idx][valid_views].reshape(-1, 3)
+        all_confidence = confidence[batch_idx][valid_views].reshape(-1)
         if point_mask is not None:
-            selected = point_mask[batch_idx][valid_views].detach().reshape(-1)
-            valid_points = valid_points[selected]
-            valid_confidence = valid_confidence[selected]
+            selected = point_mask[batch_idx][valid_views].reshape(-1)
+        else:
+            selected = torch.ones_like(all_confidence, dtype=torch.bool)
+        valid_points = all_points[selected]
+        valid_confidence = all_confidence[selected]
         merged = consolidate_observed_points(valid_points, valid_confidence, voxel_size, 0.0)
 
         export_idx = counts.get(class_name, 0)
@@ -318,6 +424,8 @@ def export_batch(
         class_dir = args.output_root / ("confidence_on" if use_confidence else "confidence_off") / safe_name(class_name)
         path = class_dir / f"sample_{export_idx:02d}_{safe_name(sample.get('object_id', sample_idx))}.ply"
         write_ascii_ply(str(path), merged)
+        confidence_path = path.with_name(path.stem + "_confidence.ply")
+        write_confidence_ply(confidence_path, all_points, all_confidence, selected)
         if args.save_raw_frames:
             export_raw_frames(path, data["views"][batch_idx].detach(), valid_views)
 
@@ -331,6 +439,10 @@ def export_batch(
                 "frame_id": sample.get("frame_id"),
                 "num_views": int(sample.get("num_views", int(valid_views.sum().item()))),
                 "num_fused_points": int(merged.shape[0]),
+                "confidence_path": str(confidence_path),
+                "num_confidence_points": int(all_points.shape[0]),
+                "num_kept_points": int(selected.sum().detach().cpu().item()),
+                "num_rejected_points": int((~selected).sum().detach().cpu().item()),
                 "true_label": int(label),
                 "pred_label": int(pred[batch_idx]),
                 "pred_class": dataset.classes[int(pred[batch_idx])] if int(pred[batch_idx]) < len(dataset.classes) else str(pred[batch_idx]),
@@ -344,13 +456,14 @@ def export_batch(
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    set_random_seed(args.seed, deterministic=True)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA wurde angefordert, ist aber nicht verfuegbar.")
     device = torch.device("cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu")
 
     cfg = load_cfg(args)
     checkpoint = find_checkpoint(args)
+    configure_output_root(args)
+    set_random_seed(args.seed, deterministic=True)
     dataset = build_dataset(cfg, args.split)
     restrict_dataset_classes(dataset, list(cfg.get("raw_frames_classes", DEFAULT_CLASSES)))
     cfg.classes = list(dataset.classes)

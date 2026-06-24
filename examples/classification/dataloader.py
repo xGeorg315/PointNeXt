@@ -2716,6 +2716,13 @@ class RawFramesClassificationDataset(PointCloudDataset):
             (self.raw_frames_max_views, 3), dtype=np.float32
         )
         pose_mask = np.zeros(self.raw_frames_max_views, dtype=np.bool_)
+        view_origins = np.zeros(
+            (self.raw_frames_max_views, 3), dtype=np.float32
+        )
+        if pose_supervision and self.normalize:
+            view_origins[:] = (-normalization_centroid / normalization_radius).astype(
+                np.float32, copy=False
+            )
 
         transforms = [record.get("pose_transform") for record in view_records]
         anchor_transform = transforms[0] if transforms else None
@@ -2751,6 +2758,7 @@ class RawFramesClassificationDataset(PointCloudDataset):
             "pose_rotations": torch.from_numpy(pose_rotations).float(),
             "pose_translations": torch.from_numpy(pose_translations).float(),
             "pose_mask": torch.from_numpy(pose_mask),
+            "view_origins": torch.from_numpy(view_origins).float(),
             "x": torch.from_numpy(views[0]).float(),
             "pos": torch.from_numpy(representative_points).float(),
             "y": torch.tensor(sample["label"]).long(),
