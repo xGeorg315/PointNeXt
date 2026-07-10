@@ -569,6 +569,11 @@ class PointCloudDataset(Dataset):
         augment_translate=0.1,
         augment_random_points_ratio=0.0,
         augment_random_points_scale=1.0,
+        augment_viewpoint_topdown_prob=0.0,
+        augment_topdown_keep_ratio=(0.25, 0.6),
+        augment_topdown_z_squash=(0.5, 1.0),
+        augment_topdown_top_bias=0.6,
+        augment_topdown_xy_jitter=0.0,
         use_normals=False,
         normal_k=16,
         preload_data=False,
@@ -600,10 +605,25 @@ class PointCloudDataset(Dataset):
         self.completion_mask_parts = int(completion_mask_parts)
         self.exclude_classes = set(_as_name_list(exclude_classes))
         self.augment_train = _as_bool(augment_train)
+        self.augment_rotation_deg = float(augment_rotation_deg or 0.0)
+        self.augment_scale = _as_float_range(augment_scale, (0.8, 1.2))
         self.augment_dropout = _as_float_range(augment_dropout, (0.2, 0.5))
         self.augment_translate = _as_xyz_range(augment_translate, (0.1, 0.1, 0.1))
         self.augment_random_points_ratio = max(0.0, float(augment_random_points_ratio or 0.0))
         self.augment_random_points_scale = max(0.0, float(augment_random_points_scale or 1.0))
+        self.augment_viewpoint_topdown_prob = min(
+            1.0, max(0.0, float(augment_viewpoint_topdown_prob or 0.0))
+        )
+        self.augment_topdown_keep_ratio = _as_float_range(
+            augment_topdown_keep_ratio, (0.25, 0.6)
+        )
+        self.augment_topdown_z_squash = _as_float_range(
+            augment_topdown_z_squash, (0.5, 1.0)
+        )
+        self.augment_topdown_top_bias = min(
+            1.0, max(0.0, float(augment_topdown_top_bias or 0.0))
+        )
+        self.augment_topdown_xy_jitter = max(0.0, float(augment_topdown_xy_jitter or 0.0))
         self.use_normals = _as_bool(use_normals)
         self.normal_k = max(3, int(normal_k or 16))
         self.preload_data = _as_bool(preload_data)
@@ -617,15 +637,13 @@ class PointCloudDataset(Dataset):
         self._scale_transform = None
         self._jitter_transform = None
         self._translation_transform = None
-        rotation = float(augment_rotation_deg or 0.0)
-        scale = _as_float_range(augment_scale, (0.8, 1.2))
         jitter_sigma = float(augment_jitter_sigma or 0.0)
         jitter_clip = float(augment_jitter_clip or 0.0)
-        if rotation > 0:
-            angle = rotation / 180.0
+        if self.augment_rotation_deg > 0:
+            angle = self.augment_rotation_deg / 180.0
             self._rotation_transform = RandomRotate(angle=[angle, angle, angle])
-        if scale != (1.0, 1.0):
-            self._scale_transform = RandomScale(scale=list(scale))
+        if self.augment_scale != (1.0, 1.0):
+            self._scale_transform = RandomScale(scale=list(self.augment_scale))
         if jitter_sigma > 0 and jitter_clip > 0:
             self._jitter_transform = RandomJitter(
                 jitter_sigma=jitter_sigma,
@@ -917,6 +935,48 @@ class PointCloudDataset(Dataset):
         ).astype(np.float32)
         return np.concatenate([points, random_points], axis=0).astype(np.float32, copy=False)
 
+    def _simulate_topdown_view(self, points):
+        if (
+            not self._should_augment_classification()
+            or self.augment_viewpoint_topdown_prob <= 0
+            or np.random.rand() >= self.augment_viewpoint_topdown_prob
+            or points.shape[0] <= 1
+        ):
+            return points
+
+        points = points.astype(np.float32, copy=True)
+        keep_min, keep_max = self.augment_topdown_keep_ratio
+        keep_ratio = float(np.random.uniform(keep_min, keep_max))
+        keep_ratio = min(1.0, max(1.0 / points.shape[0], keep_ratio))
+        keep_count = max(1, int(round(points.shape[0] * keep_ratio)))
+
+        z = points[:, 2]
+        z_span = float(z.max() - z.min())
+        if z_span > 1e-6 and self.augment_topdown_top_bias > 0:
+            z_rank = (z - z.min()) / z_span
+            weights = (
+                (1.0 - self.augment_topdown_top_bias)
+                + self.augment_topdown_top_bias * z_rank
+            )
+            weights = weights / weights.sum()
+            indices = np.random.choice(
+                points.shape[0], keep_count, replace=False, p=weights
+            )
+        else:
+            indices = np.random.choice(points.shape[0], keep_count, replace=False)
+        points = points[indices]
+
+        squash_min, squash_max = self.augment_topdown_z_squash
+        z_scale = float(np.random.uniform(squash_min, squash_max))
+        z_center = float(points[:, 2].mean())
+        points[:, 2] = z_center + (points[:, 2] - z_center) * z_scale
+
+        if self.augment_topdown_xy_jitter > 0:
+            points[:, :2] += np.random.normal(
+                0.0, self.augment_topdown_xy_jitter, size=points[:, :2].shape
+            ).astype(np.float32)
+        return points.astype(np.float32, copy=False)
+
     def _apply_geometric_augmentations(self, points):
         if not self._should_augment_classification():
             return points.astype(np.float32, copy=False)
@@ -931,6 +991,47 @@ class PointCloudDataset(Dataset):
             data = self._translation_transform(data)
             return data["pos"].numpy().astype(np.float32, copy=False)
         return data["pos"].astype(np.float32, copy=False)
+
+    def _sample_shared_geometric_augmentation(self):
+        rotation = np.eye(3, dtype=np.float32)
+        if self._should_augment_classification() and self.augment_rotation_deg > 0:
+            max_angle = np.deg2rad(self.augment_rotation_deg)
+            angles = np.random.uniform(-max_angle, max_angle, size=3)
+            sx, cx = np.sin(angles[0]), np.cos(angles[0])
+            sy, cy = np.sin(angles[1]), np.cos(angles[1])
+            sz, cz = np.sin(angles[2]), np.cos(angles[2])
+            rx = np.array(
+                [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]],
+                dtype=np.float32,
+            )
+            ry = np.array(
+                [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]],
+                dtype=np.float32,
+            )
+            rz = np.array(
+                [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+            rotation = (rz @ ry @ rx).astype(np.float32, copy=False)
+
+        scale = 1.0
+        if self._should_augment_classification() and self.augment_scale != (1.0, 1.0):
+            scale = float(np.random.uniform(*self.augment_scale))
+
+        translation = np.zeros(3, dtype=np.float32)
+        if self._should_augment_classification() and any(value > 0 for value in self.augment_translate):
+            shifts = np.asarray(self.augment_translate, dtype=np.float32)
+            translation = np.random.uniform(-shifts, shifts).astype(np.float32)
+
+        return rotation, scale, translation
+
+    def _apply_shared_geometric_augmentation(self, points, rotation, scale, translation):
+        points = points.astype(np.float32, copy=True)
+        points = scale * (points @ rotation.T) + translation
+        if self._jitter_transform is not None and self._should_augment_classification():
+            data = self._jitter_transform({"pos": points})
+            points = data["pos"]
+        return points.astype(np.float32, copy=False)
 
     def _estimate_normals(self, points):
         points = points[:, :3].astype(np.float32, copy=False)
@@ -1244,6 +1345,7 @@ class PointCloudDataset(Dataset):
         if self.normalize:
             points = self._normalize(points)
 
+        points = self._simulate_topdown_view(points)
         points = self._apply_point_dropout(points)
         points = self._include_random_points(points)
 
@@ -1304,6 +1406,11 @@ def get_dataloader(
     augment_translate=0.1,
     augment_random_points_ratio=0.0,
     augment_random_points_scale=1.0,
+    augment_viewpoint_topdown_prob=0.0,
+    augment_topdown_keep_ratio=(0.25, 0.6),
+    augment_topdown_z_squash=(0.5, 1.0),
+    augment_topdown_top_bias=0.6,
+    augment_topdown_xy_jitter=0.0,
     use_normals=False,
     normal_k=16,
     preload_data=False,
@@ -1341,6 +1448,11 @@ def get_dataloader(
         augment_translate=augment_translate,
         augment_random_points_ratio=augment_random_points_ratio,
         augment_random_points_scale=augment_random_points_scale,
+        augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+        augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+        augment_topdown_z_squash=augment_topdown_z_squash,
+        augment_topdown_top_bias=augment_topdown_top_bias,
+        augment_topdown_xy_jitter=augment_topdown_xy_jitter,
         use_normals=use_normals,
         normal_k=normal_k,
         preload_data=preload_data,
@@ -1679,6 +1791,11 @@ class ReviewClassificationDataset(ReviewCompletionDataset):
         augment_translate=0.1,
         augment_random_points_ratio=0.0,
         augment_random_points_scale=1.0,
+        augment_viewpoint_topdown_prob=0.0,
+        augment_topdown_keep_ratio=(0.25, 0.6),
+        augment_topdown_z_squash=(0.5, 1.0),
+        augment_topdown_top_bias=0.6,
+        augment_topdown_xy_jitter=0.0,
         use_normals=False,
         normal_k=16,
         preload_data=False,
@@ -1717,6 +1834,11 @@ class ReviewClassificationDataset(ReviewCompletionDataset):
             augment_translate=augment_translate,
             augment_random_points_ratio=augment_random_points_ratio,
             augment_random_points_scale=augment_random_points_scale,
+            augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+            augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+            augment_topdown_z_squash=augment_topdown_z_squash,
+            augment_topdown_top_bias=augment_topdown_top_bias,
+            augment_topdown_xy_jitter=augment_topdown_xy_jitter,
             use_normals=use_normals,
             normal_k=normal_k,
             preload_data=preload_data,
@@ -1954,6 +2076,11 @@ class ModelNet40OffClassificationDataset(PointCloudDataset):
         augment_translate=0.0,
         augment_random_points_ratio=0.0,
         augment_random_points_scale=1.0,
+        augment_viewpoint_topdown_prob=0.0,
+        augment_topdown_keep_ratio=(0.25, 0.6),
+        augment_topdown_z_squash=(0.5, 1.0),
+        augment_topdown_top_bias=0.6,
+        augment_topdown_xy_jitter=0.0,
         use_normals=False,
         normal_k=16,
         preload_data=False,
@@ -1979,6 +2106,11 @@ class ModelNet40OffClassificationDataset(PointCloudDataset):
             augment_translate=augment_translate,
             augment_random_points_ratio=augment_random_points_ratio,
             augment_random_points_scale=augment_random_points_scale,
+            augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+            augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+            augment_topdown_z_squash=augment_topdown_z_squash,
+            augment_topdown_top_bias=augment_topdown_top_bias,
+            augment_topdown_xy_jitter=augment_topdown_xy_jitter,
             use_normals=use_normals,
             normal_k=normal_k,
             preload_data=preload_data,
@@ -2021,6 +2153,11 @@ def get_modelnet40_off_classification_dataloader(
     augment_translate=0.0,
     augment_random_points_ratio=0.0,
     augment_random_points_scale=1.0,
+    augment_viewpoint_topdown_prob=0.0,
+    augment_topdown_keep_ratio=(0.25, 0.6),
+    augment_topdown_z_squash=(0.5, 1.0),
+    augment_topdown_top_bias=0.6,
+    augment_topdown_xy_jitter=0.0,
     use_normals=False,
     normal_k=16,
     preload_data=False,
@@ -2042,6 +2179,11 @@ def get_modelnet40_off_classification_dataloader(
         augment_translate=augment_translate,
         augment_random_points_ratio=augment_random_points_ratio,
         augment_random_points_scale=augment_random_points_scale,
+        augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+        augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+        augment_topdown_z_squash=augment_topdown_z_squash,
+        augment_topdown_top_bias=augment_topdown_top_bias,
+        augment_topdown_xy_jitter=augment_topdown_xy_jitter,
         use_normals=use_normals,
         normal_k=normal_k,
         preload_data=preload_data,
@@ -2091,6 +2233,11 @@ def get_review_classification_dataloader(
     augment_translate=0.1,
     augment_random_points_ratio=0.0,
     augment_random_points_scale=1.0,
+    augment_viewpoint_topdown_prob=0.0,
+    augment_topdown_keep_ratio=(0.25, 0.6),
+    augment_topdown_z_squash=(0.5, 1.0),
+    augment_topdown_top_bias=0.6,
+    augment_topdown_xy_jitter=0.0,
     use_normals=False,
     normal_k=16,
     preload_data=False,
@@ -2121,6 +2268,11 @@ def get_review_classification_dataloader(
         augment_translate=augment_translate,
         augment_random_points_ratio=augment_random_points_ratio,
         augment_random_points_scale=augment_random_points_scale,
+        augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+        augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+        augment_topdown_z_squash=augment_topdown_z_squash,
+        augment_topdown_top_bias=augment_topdown_top_bias,
+        augment_topdown_xy_jitter=augment_topdown_xy_jitter,
         use_normals=use_normals,
         normal_k=normal_k,
         preload_data=preload_data,
@@ -2176,6 +2328,11 @@ class RawFramesClassificationDataset(PointCloudDataset):
         augment_translate=0.1,
         augment_random_points_ratio=0.0,
         augment_random_points_scale=1.0,
+        augment_viewpoint_topdown_prob=0.0,
+        augment_topdown_keep_ratio=(0.25, 0.6),
+        augment_topdown_z_squash=(0.5, 1.0),
+        augment_topdown_top_bias=0.6,
+        augment_topdown_xy_jitter=0.0,
         use_normals=False,
         normal_k=16,
         preload_data=False,
@@ -2217,6 +2374,11 @@ class RawFramesClassificationDataset(PointCloudDataset):
             augment_translate=augment_translate,
             augment_random_points_ratio=augment_random_points_ratio,
             augment_random_points_scale=augment_random_points_scale,
+            augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+            augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+            augment_topdown_z_squash=augment_topdown_z_squash,
+            augment_topdown_top_bias=augment_topdown_top_bias,
+            augment_topdown_xy_jitter=augment_topdown_xy_jitter,
             use_normals=use_normals,
             normal_k=normal_k,
             preload_data=preload_data,
@@ -2643,6 +2805,7 @@ class RawFramesClassificationDataset(PointCloudDataset):
         points = self._load_points(record["file"])
         if self.normalize:
             points = self._normalize(points)
+        points = self._simulate_topdown_view(points)
         points = self._apply_point_dropout(points)
         points = self._include_random_points(points)
         points = self._resample(
@@ -2678,6 +2841,7 @@ class RawFramesClassificationDataset(PointCloudDataset):
                     points = self._normalize_with_centroid(
                         points, normalization_centroid, normalization_radius
                     )
+                points = self._simulate_topdown_view(points)
                 points = self._apply_point_dropout(points)
                 points = self._include_random_points(points)
                 points = self._resample(
@@ -2685,7 +2849,17 @@ class RawFramesClassificationDataset(PointCloudDataset):
                     jitter=self.split == "train",
                 )
                 prepared_views.append(points.astype(np.float32, copy=False))
+            aug_rotation, aug_scale, aug_translation = self._sample_shared_geometric_augmentation()
+            prepared_views = [
+                self._apply_shared_geometric_augmentation(
+                    points, aug_rotation, aug_scale, aug_translation
+                )
+                for points in prepared_views
+            ]
         else:
+            aug_rotation = np.eye(3, dtype=np.float32)
+            aug_scale = 1.0
+            aug_translation = np.zeros(3, dtype=np.float32)
             prepared_views = [
                 self._prepare_view_points(
                     record, apply_geometric_augmentations=False
@@ -2723,6 +2897,10 @@ class RawFramesClassificationDataset(PointCloudDataset):
             view_origins[:] = (-normalization_centroid / normalization_radius).astype(
                 np.float32, copy=False
             )
+        if pose_supervision:
+            view_origins = (
+                aug_scale * (view_origins @ aug_rotation.T) + aug_translation
+            ).astype(np.float32, copy=False)
 
         transforms = [record.get("pose_transform") for record in view_records]
         anchor_transform = transforms[0] if transforms else None
@@ -2745,6 +2923,15 @@ class RawFramesClassificationDataset(PointCloudDataset):
                     np.matmul(rotation, normalization_centroid)
                     + translation - normalization_centroid
                 ) / normalization_radius
+            if pose_supervision:
+                rotation = (
+                    aug_rotation @ rotation @ aug_rotation.T
+                ).astype(np.float32, copy=False)
+                translation = (
+                    aug_scale * (aug_rotation @ translation)
+                    + aug_translation
+                    - rotation @ aug_translation
+                ).astype(np.float32, copy=False)
             pose_rotations[view_idx] = rotation
             pose_translations[view_idx] = translation
             pose_mask[view_idx] = True
@@ -2802,6 +2989,11 @@ def get_raw_frames_classification_dataloader(
     augment_translate=0.1,
     augment_random_points_ratio=0.0,
     augment_random_points_scale=1.0,
+    augment_viewpoint_topdown_prob=0.0,
+    augment_topdown_keep_ratio=(0.25, 0.6),
+    augment_topdown_z_squash=(0.5, 1.0),
+    augment_topdown_top_bias=0.6,
+    augment_topdown_xy_jitter=0.0,
     use_normals=False,
     normal_k=16,
     preload_data=False,
@@ -2836,6 +3028,11 @@ def get_raw_frames_classification_dataloader(
         augment_translate=augment_translate,
         augment_random_points_ratio=augment_random_points_ratio,
         augment_random_points_scale=augment_random_points_scale,
+        augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+        augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+        augment_topdown_z_squash=augment_topdown_z_squash,
+        augment_topdown_top_bias=augment_topdown_top_bias,
+        augment_topdown_xy_jitter=augment_topdown_xy_jitter,
         use_normals=use_normals,
         normal_k=normal_k,
         preload_data=preload_data,
@@ -2977,6 +3174,11 @@ def get_mixed_classification_dataloaders(
     augment_translate=0.1,
     augment_random_points_ratio=0.0,
     augment_random_points_scale=1.0,
+    augment_viewpoint_topdown_prob=0.0,
+    augment_topdown_keep_ratio=(0.25, 0.6),
+    augment_topdown_z_squash=(0.5, 1.0),
+    augment_topdown_top_bias=0.6,
+    augment_topdown_xy_jitter=0.0,
     use_normals=False,
     normal_k=16,
     preload_data=False,
@@ -3005,6 +3207,11 @@ def get_mixed_classification_dataloaders(
         augment_translate=augment_translate,
         augment_random_points_ratio=augment_random_points_ratio,
         augment_random_points_scale=augment_random_points_scale,
+        augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+        augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+        augment_topdown_z_squash=augment_topdown_z_squash,
+        augment_topdown_top_bias=augment_topdown_top_bias,
+        augment_topdown_xy_jitter=augment_topdown_xy_jitter,
         use_normals=use_normals,
         normal_k=normal_k,
         preload_data=preload_data,
@@ -3031,6 +3238,11 @@ def get_mixed_classification_dataloaders(
         augment_translate=augment_translate,
         augment_random_points_ratio=augment_random_points_ratio,
         augment_random_points_scale=augment_random_points_scale,
+        augment_viewpoint_topdown_prob=augment_viewpoint_topdown_prob,
+        augment_topdown_keep_ratio=augment_topdown_keep_ratio,
+        augment_topdown_z_squash=augment_topdown_z_squash,
+        augment_topdown_top_bias=augment_topdown_top_bias,
+        augment_topdown_xy_jitter=augment_topdown_xy_jitter,
         use_normals=use_normals,
         normal_k=normal_k,
         preload_data=preload_data,
