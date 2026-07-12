@@ -377,6 +377,14 @@ def _has_bucket_first_review_layout(root_dir: Path) -> bool:
     )
 
 
+def _has_class_pcds_layout(root_dir: Path) -> bool:
+    """Return whether ``root_dir`` stores clouds as ``class_name/pcds/*.pcd``."""
+    return any(
+        class_dir.is_dir() and (class_dir / "pcds").is_dir()
+        for class_dir in root_dir.iterdir()
+    )
+
+
 def _load_pcd_xyz(file_path: Path):
     header, header_bytes = _read_pcd_header(file_path)
     data_type = header.get("DATA", [""])[0].lower()
@@ -1859,6 +1867,9 @@ class ReviewClassificationDataset(ReviewCompletionDataset):
         if _has_bucket_first_review_layout(self.review_root_dir):
             self._collect_bucket_first_classification_samples()
             return
+        if _has_class_pcds_layout(self.review_root_dir):
+            self._collect_class_pcds_classification_samples()
+            return
 
         class_dirs = [
             p for p in sorted(self.review_root_dir.iterdir())
@@ -1912,6 +1923,56 @@ class ReviewClassificationDataset(ReviewCompletionDataset):
         self.samples = [
             record
             for record in all_records
+            if split_by_key[self._record_key(record)] == self.split
+        ]
+        self._min_sensor_distance = 0.0
+
+    def _collect_class_pcds_classification_samples(self):
+        """Collect ICP aggregates stored as ``class_name/pcds/*.pcd``.
+
+        These exports have no review-day/bucket hierarchy. They use the same
+        deterministic, object-level stratified split as regular review data.
+        """
+        class_dirs = [
+            p for p in sorted(self.review_root_dir.iterdir())
+            if p.is_dir() and (p / "pcds").is_dir()
+            and p.name not in self.review_exclude_classes
+        ]
+        for idx, class_dir in enumerate(class_dirs):
+            self.class_to_idx[class_dir.name] = idx
+            self.classes.append(class_dir.name)
+
+        all_records = []
+        for class_dir in class_dirs:
+            label = self.class_to_idx[class_dir.name]
+            for pcd_file in sorted((class_dir / "pcds").glob("*.pcd")):
+                point_count = _pcd_point_count(pcd_file)
+                if (
+                    self.review_min_points > 0
+                    and class_dir.name not in self.review_min_points_exempt_classes
+                    and point_count < self.review_min_points
+                ):
+                    continue
+
+                sample_id, object_id = self._parse_review_ids(pcd_file)
+                all_records.append(
+                    {
+                        "class_name": class_dir.name,
+                        "label": label,
+                        "object_id": object_id,
+                        "sample_id": sample_id,
+                        "date": "aggregate",
+                        "bucket": "aggregate",
+                        "file": pcd_file,
+                        "point_count": point_count,
+                        "dist": 0.0,
+                    }
+                )
+
+        all_records = self._limit_records_per_class(all_records)
+        split_by_key = self._stratified_split_map(all_records)
+        self.samples = [
+            record for record in all_records
             if split_by_key[self._record_key(record)] == self.split
         ]
         self._min_sensor_distance = 0.0
@@ -2319,6 +2380,8 @@ class RawFramesClassificationDataset(PointCloudDataset):
         view_selection="uniform",
         pose_metadata_root=None,
         pose_required=False,
+        shared_view_normalization=False,
+        return_shared_geometry_views=False,
         augment_train=False,
         augment_rotation_deg=20.0,
         augment_scale=(0.8, 1.2),
@@ -2357,6 +2420,12 @@ class RawFramesClassificationDataset(PointCloudDataset):
             Path(pose_metadata_root) if pose_metadata_root else None
         )
         self.raw_frames_pose_required = _as_bool(pose_required)
+        self.raw_frames_shared_view_normalization = _as_bool(
+            shared_view_normalization
+        )
+        self.raw_frames_return_shared_geometry_views = _as_bool(
+            return_shared_geometry_views
+        )
         self._raw_frames_pose_cache = {}
         super().__init__(
             root_dir=root_dir,
@@ -2822,10 +2891,47 @@ class RawFramesClassificationDataset(PointCloudDataset):
     def _get_object_views(self, sample):
         view_records = sample["view_records"]
         pose_supervision = self.raw_frames_pose_metadata_root is not None
+        shared_normalization = (
+            pose_supervision or self.raw_frames_shared_view_normalization
+        )
         normalization_centroid = np.zeros(3, dtype=np.float32)
         normalization_radius = 1.0
+        geometry_prepared_views = None
 
-        if pose_supervision:
+        if self.raw_frames_return_shared_geometry_views:
+            geometry_raw_views = [
+                self._load_points(record["file"]) for record in view_records
+            ]
+            geometry_centroid = np.mean(geometry_raw_views[0], axis=0)
+            geometry_radius = self._unit_radius(np.concatenate([
+                points - geometry_centroid for points in geometry_raw_views
+            ], axis=0))
+            geometry_prepared_views = []
+            for points in geometry_raw_views:
+                points = self._normalize_with_centroid(
+                    points, geometry_centroid, geometry_radius
+                ) if self.normalize else points
+                points = self._simulate_topdown_view(points)
+                points = self._apply_point_dropout(points)
+                points = self._include_random_points(points)
+                points = self._resample(
+                    points, target_count=self.num_points,
+                    jitter=self.split == "train",
+                )
+                geometry_prepared_views.append(
+                    points.astype(np.float32, copy=False)
+                )
+            geom_rotation, geom_scale, geom_translation = (
+                self._sample_shared_geometric_augmentation()
+            )
+            geometry_prepared_views = [
+                self._apply_shared_geometric_augmentation(
+                    points, geom_rotation, geom_scale, geom_translation
+                )
+                for points in geometry_prepared_views
+            ]
+
+        if shared_normalization:
             raw_views = [self._load_points(record["file"]) for record in view_records]
             if self.normalize:
                 normalization_centroid = np.mean(raw_views[0], axis=0)
@@ -2882,6 +2988,10 @@ class RawFramesClassificationDataset(PointCloudDataset):
             dtype=np.float32,
         )
         view_mask = np.zeros(self.raw_frames_max_views, dtype=np.bool_)
+        geometry_views = (
+            np.zeros_like(views)
+            if geometry_prepared_views is not None else None
+        )
         pose_rotations = np.tile(
             np.eye(3, dtype=np.float32),
             (self.raw_frames_max_views, 1, 1),
@@ -2911,6 +3021,10 @@ class RawFramesClassificationDataset(PointCloudDataset):
         for view_idx, (record, points) in enumerate(
                 zip(view_records, prepared_views)):
             views[view_idx] = self._point_features(points)
+            if geometry_views is not None:
+                geometry_views[view_idx] = self._point_features(
+                    geometry_prepared_views[view_idx]
+                )
             view_mask[view_idx] = True
             transform = record.get("pose_transform")
             if transform is None or anchor_inverse is None:
@@ -2939,7 +3053,7 @@ class RawFramesClassificationDataset(PointCloudDataset):
         representative_points = prepared_views[0]
         sensor_dist = float(np.mean([record["dist"] for record in view_records]))
         obj_features = self._obj_features(representative_points, sensor_dist)
-        return {
+        output = {
             "views": torch.from_numpy(views).float(),
             "view_mask": torch.from_numpy(view_mask),
             "pose_rotations": torch.from_numpy(pose_rotations).float(),
@@ -2954,6 +3068,11 @@ class RawFramesClassificationDataset(PointCloudDataset):
             "sample_id": sample["sample_id"],
             "frame_id": sample["frame_id"],
         }
+        if geometry_views is not None:
+            output["geometry_views"] = torch.from_numpy(
+                geometry_views
+            ).float()
+        return output
 
 
 def get_raw_frames_classification_dataloader(
@@ -2977,6 +3096,8 @@ def get_raw_frames_classification_dataloader(
     view_selection="uniform",
     pose_metadata_root=None,
     pose_required=False,
+    shared_view_normalization=False,
+    return_shared_geometry_views=False,
     randomize_labels=False,
     random_label_seed=0,
     random_label_mode="permute",
@@ -3019,6 +3140,8 @@ def get_raw_frames_classification_dataloader(
         view_selection=view_selection,
         pose_metadata_root=pose_metadata_root,
         pose_required=pose_required,
+        shared_view_normalization=shared_view_normalization,
+        return_shared_geometry_views=return_shared_geometry_views,
         augment_train=augment_train,
         augment_rotation_deg=augment_rotation_deg,
         augment_scale=augment_scale,

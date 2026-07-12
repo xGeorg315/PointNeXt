@@ -1,5 +1,5 @@
-# MVF + learned fine pose head with ICP teacher supervision; same learned path as training 11 but residual target is detached ICP.
-# Start: python examples/classification/main.py --cfg cfgs/modelnet40ply2048/mvf_10class_ablation/15_mvf_fine_pose_head_with_icp_teacher.yaml
+# MVF + coarse pose head + fine ICP; current encoder, softmax view pooling.
+# Start: python examples/classification/main.py --cfg cfgs/modelnet40ply2048/mvf_10class_ablation/18_mvf_coarse_pose_fine_icp_main_5v_512_view_pool_softmax.yaml
 
 seed: 8240
 deterministic: true
@@ -87,6 +87,7 @@ model:
   max_views: 5
   minimal_architecture: true
   feature_dim: 192
+  view_pooling: softmax
   global_pooling: max_mean
   feature_projection_args:
     mlps: []
@@ -105,7 +106,7 @@ model:
   max_rotation_deg: 20.0
   max_translation: 10.0
   registration_refinement_steps: 1
-  enable_icp_refinement: false
+  enable_icp_refinement: true
   icp_iterations: 5
   icp_points: 128
   icp_max_correspondence_distance: 0.35
@@ -118,8 +119,8 @@ model:
   icp_min_iterations: 1
   lambda_cls: 0.8
   lambda_align: 1.0
-  lambda_icp_delta_reg: 0.0
-  lambda_residual_correction: 1.0
+  lambda_icp_delta_reg: 1.0
+  lambda_residual_correction: 0.0
   lambda_reg: 0.0
   lambda_overlap_point: 0.0
   lambda_density: 0.0
@@ -171,20 +172,5 @@ model:
     dropout: 0.3
     norm_args:
       norm: bn1d
-  enable_residual_correction_head: true
-  residual_correction_hidden_dim: 128
-  residual_max_translation: 0.2
-  residual_translation_axes: y
-  residual_reencode_after_coarse: true
-  residual_correction_target: icp
-  residual_loss_beta: 0.02
-  residual_correction_head_args:
-    mlps:
-    - 512
-    - 256
-    - 128
-    dropout: 0.1
-    activate_last: false
-experiment_name: 15_mvf_fine_pose_head_with_icp_teacher
-description: MVF + learned fine pose head with ICP teacher supervision; same learned
-  path as training 11 but residual target is detached ICP.
+experiment_name: 18_mvf_coarse_pose_fine_icp_main_5v_512_view_pool_softmax
+description: MVF + coarse pose head + fine ICP; current encoder, softmax view pooling.

@@ -401,6 +401,12 @@ def _build_loaders(cfg):
             view_selection=cfg.get('raw_frames_view_selection', 'uniform'),
             pose_metadata_root=cfg.get('raw_frames_pose_root', None),
             pose_required=_as_bool(cfg.get('raw_frames_pose_required', False)),
+            shared_view_normalization=_as_bool(
+                cfg.get('raw_frames_shared_view_normalization', False)
+            ),
+            return_shared_geometry_views=_as_bool(
+                cfg.get('raw_frames_return_shared_geometry_views', False)
+            ),
             **_classification_augmentation_kwargs(cfg),
         )
         train_loader = get_raw_frames_classification_dataloader(

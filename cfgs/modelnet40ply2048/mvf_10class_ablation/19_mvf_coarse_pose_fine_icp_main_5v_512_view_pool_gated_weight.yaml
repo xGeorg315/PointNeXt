@@ -1,32 +1,32 @@
-# PointNeXt 10-class baseline on ICP-aggregated point clouds.
-# Start: python examples/classification/main.py --cfg cfgs/modelnet40ply2048/mvf_10class_ablation/13_icp_aggregated_pointclouds_pointnext_10class_baseline.yaml
+# MVF + coarse pose head + fine ICP; current encoder, gated-weight view pooling.
+# Start: python examples/classification/main.py --cfg cfgs/modelnet40ply2048/mvf_10class_ablation/19_mvf_coarse_pose_fine_icp_main_5v_512_view_pool_gated_weight.yaml
 
 seed: 8240
 deterministic: true
 wandb:
   use_wandb: true
   project: mvf_10class_ablation
-mode: classification
-classification_dataset_format: review
+mode: raw_frames_classification
+classification_dataset_format: raw_frames
 raw_frames_root: /home/georg/workspace/raw-frames-full
-raw_frames_object_multi_view: false
-raw_frames_max_views: 1
+raw_frames_object_multi_view: true
+raw_frames_max_views: 5
 raw_frames_view_selection: uniform
 raw_frames_frame_selection: all
 raw_frames_pose_root: /home/georg/workspace/raw-frame-aggregates-full
-raw_frames_pose_required: false
-raw_frames_split_ratios: &id001
+raw_frames_pose_required: true
+raw_frames_split_ratios:
 - 0.8
 - 0.1
 - 0.1
 raw_frames_start_date: null
 raw_frames_min_points: 0
-raw_frames_exclude_classes: &id002
+raw_frames_exclude_classes:
 - reject
 - TLS_VEHICLE_CAR_WITH_TRAILER
 - TLS_VEHICLE_TRUCK_WITH_TRAILER
 - silhouettes_all_axes_10_per_class
-raw_frames_min_points_exempt_classes: &id003
+raw_frames_min_points_exempt_classes:
 - TLS_VEHICLE_MOTORBIKE
 - TLS_VEHICLE_TRAILER
 raw_frames_classes:
@@ -72,9 +72,9 @@ grad_norm_clip: 1.0
 criterion_args:
   NAME: SmoothCrossEntropy
   label_smoothing: 0.05
-export_fused_clouds: false
-export_pre_icp_clouds: false
-export_fused_raw_frames: false
+export_fused_clouds: true
+export_pre_icp_clouds: true
+export_fused_raw_frames: true
 fused_clouds_per_class: 2
 fusion_voxel_size: 0.0
 save_local_metrics: true
@@ -83,7 +83,50 @@ wandb_log_pcd_examples: false
 wandb_vis_max_samples: 0
 wandb_vis_max_wrong_samples: 0
 model:
-  NAME: BaseCls
+  NAME: MultiViewPointNextCls
+  max_views: 5
+  minimal_architecture: true
+  feature_dim: 192
+  view_pooling: gated_weight
+  global_pooling: max_mean
+  feature_projection_args:
+    mlps: []
+    dropout: 0.0
+    activate_last: true
+  view_fusion: none
+  enable_registration_head: true
+  registration_hidden_dim: 128
+  registration_head_args:
+    mlps:
+    - 512
+    - 256
+    - 128
+    dropout: 0.1
+    activate_last: false
+  max_rotation_deg: 20.0
+  max_translation: 10.0
+  registration_refinement_steps: 1
+  enable_icp_refinement: true
+  icp_iterations: 5
+  icp_points: 128
+  icp_max_correspondence_distance: 0.35
+  icp_normal_k: 16
+  icp_damping: 0.0001
+  icp_huber_delta: 0.02
+  icp_max_y_translation_step: 0.05
+  icp_convergence_tolerance: 0.01
+  icp_convergence_patience: 2
+  icp_min_iterations: 1
+  lambda_cls: 0.8
+  lambda_align: 1.0
+  lambda_icp_delta_reg: 1.0
+  lambda_residual_correction: 0.0
+  lambda_reg: 0.0
+  lambda_overlap_point: 0.0
+  lambda_density: 0.0
+  lambda_boundary: 0.0
+  lambda_consistency: 0.0
+  lambda_occlusion_depth: 0.0
   extra_global_channels: 0
   encoder_args:
     NAME: PointNextEncoder
@@ -122,7 +165,6 @@ model:
   cls_args:
     NAME: ClsHead
     num_classes: 10
-    global_feat: max,avg
     mlps:
     - 192
     - 192
@@ -130,10 +172,6 @@ model:
     dropout: 0.3
     norm_args:
       norm: bn1d
-experiment_name: 13_icp_aggregated_pointclouds_pointnext_10class_baseline
-description: PointNeXt 10-class baseline on ICP-aggregated point clouds.
-review_dataset_root: /home/georg/workspace/raw-frame-aggregates-full
-review_split_ratios: *id001
-review_exclude_classes: *id002
-review_min_points: 0
-review_min_points_exempt_classes: *id003
+experiment_name: 19_mvf_coarse_pose_fine_icp_main_5v_512_view_pool_gated_weight
+description: MVF + coarse pose head + fine ICP; current encoder, gated-weight view
+  pooling.

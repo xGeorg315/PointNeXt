@@ -1,5 +1,5 @@
-# MVF + fine ICP with larger PointNeXt encoder; coarse pose head kept for identical alignment setup.
-# Start: python examples/classification/main.py --cfg cfgs/modelnet40ply2048/mvf_10class_ablation/03_mvf_fine_icp_pointnext_large.yaml
+# MVF + coarse pose head + fine ICP; main variant, 5 views, 512 points, small encoder.
+# Start: python examples/classification/main.py --cfg cfgs/modelnet40ply2048/mvf_10class_ablation/16_mvf_coarse_pose_fine_icp_main_5v_512_small.yaml
 
 seed: 8240
 deterministic: true
@@ -86,7 +86,7 @@ model:
   NAME: MultiViewPointNextCls
   max_views: 5
   minimal_architecture: true
-  feature_dim: 256
+  feature_dim: 128
   global_pooling: max_mean
   feature_projection_args:
     mlps: []
@@ -100,7 +100,6 @@ model:
     - 512
     - 256
     - 128
-    - 64
     dropout: 0.1
     activate_last: false
   max_rotation_deg: 20.0
@@ -142,13 +141,13 @@ model:
     - 2
     - 2
     - 2
-    width: 32
+    width: 8
     in_channels: 3
     radius: 0.15
     radius_scaling: 1.5
-    sa_layers: 2
+    sa_layers: 1
     sa_use_res: true
-    nsample: 32
+    nsample: 16
     expansion: 4
     aggr_args:
       feature_type: dp_fj
@@ -166,12 +165,12 @@ model:
     NAME: ClsHead
     num_classes: 10
     mlps:
-    - 256
-    - 256
     - 128
+    - 128
+    - 64
     dropout: 0.3
     norm_args:
       norm: bn1d
-experiment_name: 03_mvf_fine_icp_pointnext_large
-description: MVF + fine ICP with larger PointNeXt encoder; coarse pose head kept for
-  identical alignment setup.
+experiment_name: 16_mvf_coarse_pose_fine_icp_main_5v_512_small
+description: MVF + coarse pose head + fine ICP; main variant, 5 views, 512 points,
+  small encoder.

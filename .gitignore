@@ -11,6 +11,7 @@ dcgm/
 boundary_label_audit/
 boundary_label_methods_audit/
 exports/
+validation/
 # Byte-compiled / optimized / DLL files
 .idea/
 __pycache__/

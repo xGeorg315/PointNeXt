@@ -122,6 +122,7 @@ model:
   cls_args:
     NAME: ClsHead
     num_classes: 10
+    global_feat: max,avg
     mlps:
     - 192
     - 192
