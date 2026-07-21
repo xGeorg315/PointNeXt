@@ -12,7 +12,7 @@ raw_frames_root: /home/georg/workspace/raw-frames-full
 raw_frames_object_multi_view: false
 raw_frames_max_views: 1
 raw_frames_view_selection: uniform
-raw_frames_frame_selection: all
+raw_frames_frame_selection: largest_extent
 raw_frames_pose_root: /home/georg/workspace/raw-frame-aggregates-full
 raw_frames_pose_required: false
 raw_frames_split_ratios:

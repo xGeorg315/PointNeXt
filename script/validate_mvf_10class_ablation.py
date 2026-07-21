@@ -33,7 +33,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from examples.classification.dataloader import RawFramesClassificationDataset
+from examples.classification.dataloader import (
+    RawFramesClassificationDataset,
+    ReviewClassificationDataset,
+)
 from openpoints.models import build_model_from_cfg
 from openpoints.utils import EasyConfig, load_checkpoint, set_random_seed
 
@@ -57,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         help="Inference device. Use --device cpu for explicit CPU inference.")
     p.add_argument(
         "--top-down-rotation-deg-z", type=float, default=-121.0,
-        help="Rotate top-down samples around Z before inference (default: 121.0 degrees).")
+        help="Rotate all top-down inputs, including ICP aggregates, around Z before inference (default: -121.0 degrees).")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--checkpoint", choices=("best", "latest"), default="best")
     p.add_argument("--configs", nargs="*", help="Optional config stems or numeric prefixes, e.g. 01 09.")
@@ -92,6 +95,15 @@ def load_cfg(path: Path) -> EasyConfig:
     return cfg
 
 
+def is_raw_single_view_config(cfg: EasyConfig) -> bool:
+    """Whether the checkpoint consumes one independently classified raw frame."""
+    return (
+        str(cfg.get("classification_dataset_format", "")).lower() == "raw_frames"
+        and str(cfg.model.get("NAME", "")) == "BaseCls"
+        and not as_bool(cfg.get("raw_frames_object_multi_view", False))
+    )
+
+
 def dataset_kwargs(cfg: EasyConfig, root: Path, split: str, top_down: bool) -> dict:
     # augment_train is harmless for test/all, but explicitly disabling it makes
     # the evaluation contract clear and avoids future dataset changes leaking in.
@@ -99,6 +111,11 @@ def dataset_kwargs(cfg: EasyConfig, root: Path, split: str, top_down: bool) -> d
     if top_down:
         # This is an export directory for Config 13, not a semantic class.
         exclude_classes = tuple(dict.fromkeys((*exclude_classes, "top-down-aggregates")))
+    frame_selection = cfg.get("raw_frames_frame_selection", "all")
+    # A single-view model must be evaluated once per object, not once per raw
+    # frame. Pick the most spatially complete frame for both test and top-down.
+    if is_raw_single_view_config(cfg):
+        frame_selection = "largest_extent"
     return dict(
         root_dir=str(root), split=split, num_points=int(cfg.num_points),
         start_date=None if top_down else cfg.get("raw_frames_start_date", None),
@@ -107,7 +124,7 @@ def dataset_kwargs(cfg: EasyConfig, root: Path, split: str, top_down: bool) -> d
         exclude_classes=exclude_classes,
         min_points_exempt_classes=cfg.get("raw_frames_min_points_exempt_classes", ()),
         forced_classes=cfg.get("raw_frames_classes", None),
-        frame_selection=cfg.get("raw_frames_frame_selection", "all"),
+        frame_selection=frame_selection,
         object_multi_view=as_bool(cfg.get("raw_frames_object_multi_view", False)),
         max_views=int(cfg.get("raw_frames_max_views", cfg.model.get("max_views", 1))),
         view_selection=cfg.get("raw_frames_view_selection", "uniform"),
@@ -129,21 +146,39 @@ class AllTopDownDataset(RawFramesClassificationDataset):
         return {self._record_key(record): self.split for record in records}
 
 
+class AllTopDownReviewDataset(ReviewClassificationDataset):
+    """Use every ICP aggregate without applying the training split again."""
+    def _stratified_split_map(self, records):
+        return {self._record_key(record): self.split for record in records}
+
+
+def review_dataset_kwargs(cfg: EasyConfig, root: Path, split: str, *, buckets=None) -> dict:
+    """Mirror Config-13's ReviewClassificationDataset training arguments."""
+    return dict(
+        root_dir=str(root), split=split, num_points=int(cfg.num_points),
+        start_date=cfg.get("review_start_date", None),
+        min_points=cfg.get("review_min_points", 0),
+        split_ratios=cfg.get("review_split_ratios", (0.8, 0.1, 0.1)),
+        buckets=buckets if buckets is not None else cfg.get("review_buckets", None),
+        source_dir=cfg.get("review_source_dir", "pred"),
+        exclude_classes=cfg.get("exclude_classes", cfg.get("review_exclude_classes", ("reject",))),
+        min_points_exempt_classes=cfg.get(
+            "review_min_points_exempt_classes", ("TLS_VEHICLE_MOTORBIKE", "TLS_VEHICLE_TRAILER")),
+        augment_train=False, use_normals=as_bool(cfg.get("use_normals", False)),
+        normal_k=int(cfg.get("normal_k", 16)), preload_data=as_bool(cfg.get("preload_data", False)),
+        max_samples_per_class=cfg.get("max_samples_per_class", None),
+        obj_features_include_sensor_dist=as_bool(cfg.get("obj_features_include_sensor_dist", True)),
+    )
+
+
 def build_datasets(
         cfg: EasyConfig, *, include_top_down: bool = True
 ) -> tuple[RawFramesClassificationDataset, RawFramesClassificationDataset | None]:
     dataset_format = str(cfg.get("classification_dataset_format", "raw_frames")).lower()
     if dataset_format == "review":
-        # Config 13 stores ICP aggregates in class/pcds/*.pcd.  This is the
-        # raw-frame loader's supported aggregate layout (the review loader
-        # expects class/day/bucket/source and would return an empty dataset).
         aggregate_root = Path(cfg.get("review_dataset_root", cfg.get("custom_dataset_root")))
-        kwargs = dataset_kwargs(cfg, aggregate_root, "test", top_down=False)
-        kwargs.update(
-            split_ratios=cfg.get("review_split_ratios", kwargs["split_ratios"]),
-            min_points=cfg.get("review_min_points", 0), object_multi_view=False,
-            max_views=1, pose_metadata_root=None, pose_required=False)
-        train_test = RawFramesClassificationDataset(**kwargs)
+        train_test = ReviewClassificationDataset(**review_dataset_kwargs(
+            cfg, aggregate_root, "test"))
     else:
         train_test = RawFramesClassificationDataset(**dataset_kwargs(
             cfg, Path(cfg.raw_frames_root), "test", top_down=False
@@ -163,30 +198,130 @@ def build_datasets(
     return train_test, top_down
 
 
-def build_icp_aggregate_top_down_datasets(
-        cfg: EasyConfig, classes: list[str]) -> dict[str, RawFramesClassificationDataset]:
-    """Load Config 13's ICP aggregates separately for same/diff predictions."""
-    datasets = {}
+def build_icp_aggregate_top_down_dataset(
+        cfg: EasyConfig, classes: list[str]) -> ReviewClassificationDataset:
+    """Load all Config-13 ICP aggregates in one combined top-down test set."""
     class_to_idx = {name: idx for idx, name in enumerate(classes)}
-    for bucket in ("gt-pred-same", "gt-pred-diff"):
-        root = ARGS.icp_aggregates_root / bucket
-        if not root.is_dir():
-            raise FileNotFoundError(f"Missing ICP aggregate directory: {root}")
-        dataset = AllTopDownDataset(**dataset_kwargs(cfg, root, "all", top_down=True))
-        observed = {sample["class_name"] for sample in dataset.samples}
-        unknown = observed.difference(class_to_idx)
-        if unknown:
-            raise RuntimeError(
-                f"Unexpected classes in {bucket}: {sorted(unknown)}; expected {classes}")
-        # A bucket can legitimately omit classes. Keep the training class order
-        # so its confusion matrix remains directly comparable to Config 13.
-        for sample in dataset.samples:
-            sample["label"] = class_to_idx[sample["class_name"]]
-        dataset.classes = list(classes)
-        dataset.class_to_idx = class_to_idx
-        dataset.num_classes = len(classes)
-        datasets[bucket] = dataset
-    return datasets
+    dataset = AllTopDownReviewDataset(**review_dataset_kwargs(
+        cfg, ARGS.icp_aggregates_root, "all",
+        buckets=("gt-pred-same", "gt-pred-diff")))
+    observed = {sample["class_name"] for sample in dataset.samples}
+    unknown = observed.difference(class_to_idx)
+    if unknown:
+        raise RuntimeError(f"Unexpected aggregate classes: {sorted(unknown)}; expected {classes}")
+    for sample in dataset.samples:
+        sample["label"] = class_to_idx[sample["class_name"]]
+    dataset.classes = list(classes)
+    dataset.class_to_idx = class_to_idx
+    dataset.num_classes = len(classes)
+    return dataset
+
+
+def build_icp_aggregate_source_dataset(
+        cfg: EasyConfig, root: Path | None = None) -> AllTopDownDataset:
+    """Load raw-frame groups used to create an ICP aggregate set."""
+    kwargs = dataset_kwargs(cfg, root or ARGS.top_down_root, "all", top_down=True)
+    kwargs.update(
+        object_multi_view=True,
+        max_views=1_000_000,
+        frame_selection="all",
+        pose_metadata_root=None,
+        pose_required=False,
+        preload_data=False,
+    )
+    return AllTopDownDataset(**kwargs)
+
+
+def _track_id(sample: dict) -> str | None:
+    match = re.search(r"__track_([^_]+)", str(sample.get("sample_id", "")))
+    return match.group(1) if match else None
+
+
+def recorded_icp_aggregate_latency(aggregate_dataset, fallback_reason: str) -> dict:
+    """Summarize ICP/fusion timings recorded when the aggregate was exported."""
+    timings = []
+    missing_metrics = 0
+    for sample in aggregate_dataset.samples:
+        file_path = Path(sample["file"])
+        metadata_path = file_path.parent.parent / "json" / f"{file_path.stem}.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            value = metadata.get("metrics", {}).get("fusion_total_wall_seconds")
+            if value is None:
+                value = metadata.get("metrics", {}).get("fusion_core_wall_seconds")
+            if value is None:
+                raise ValueError("missing fusion timing")
+            timings.append(float(value))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            missing_metrics += 1
+    if not timings:
+        return {"available": False, "reason": fallback_reason,
+                "aggregate_objects": len(aggregate_dataset.samples),
+                "missing_recorded_metrics": missing_metrics}
+    return {
+        "available": True,
+        "scope": "ICP registration and voxel fusion; recorded during aggregate export",
+        "device": "cpu",
+        "aggregate_objects": len(aggregate_dataset.samples),
+        "timed_runs": len(timings),
+        "missing_recorded_metrics": missing_metrics,
+        "fallback_reason": fallback_reason,
+        **latency_statistics(timings),
+    }
+
+
+def benchmark_icp_aggregate_sources(
+        source_dataset: AllTopDownDataset,
+        aggregate_dataset: RawFramesClassificationDataset) -> dict:
+    """Benchmark reconstruction for exactly the objects in one aggregate bucket."""
+    source_by_track = {
+        track_id: sample
+        for sample in source_dataset.samples
+        if (track_id := _track_id(sample)) is not None
+    }
+    wanted = [
+        track_id for sample in aggregate_dataset.samples
+        if (track_id := _track_id(sample)) is not None
+    ]
+    selected = [source_by_track[track_id] for track_id in wanted
+                if track_id in source_by_track]
+    missing = len(wanted) - len(selected)
+    if not selected:
+        return {
+            "available": False,
+            "reason": "no matching top-down raw-frame groups for live ICP measurement",
+            "aggregate_objects": len(wanted),
+            "matched_raw_frame_groups": 0,
+            "unmatched_aggregates": missing,
+        }
+    original_samples = source_dataset.samples
+    try:
+        source_dataset.samples = selected
+        timings, failed, reason = measure_tracking_icp(
+            source_dataset, list(range(len(selected))))
+    finally:
+        source_dataset.samples = original_samples
+    if not timings:
+        return {
+            "available": False,
+            "reason": reason or "no live ICP aggregation timings collected",
+            "aggregate_objects": len(wanted),
+            "matched_raw_frame_groups": len(selected),
+            "unmatched_aggregates": missing,
+        }
+    return {
+        "available": True,
+        "scope": "tracking ICP registration and voxel fusion only; raw top-down frames",
+        "device": "cpu",
+        "repetitions_per_object": ARGS.tracking_icp_repetitions,
+        "warmup_per_object": ARGS.tracking_icp_warmup,
+        "failed_objects": failed,
+        "aggregate_objects": len(wanted),
+        "matched_raw_frame_groups": len(selected),
+        "unmatched_aggregates": missing,
+        "timed_runs": len(timings),
+        **latency_statistics(timings),
+    }
 
 
 def remap_dataset_classes(dataset, classes: list[str]) -> None:
@@ -204,6 +339,7 @@ def build_fair_single_view_object_datasets(cfg: EasyConfig, classes: list[str]):
     """Group the same objects as MVF while retaining per-view normalization."""
     common = dict(
         object_multi_view=True, max_views=int(ARGS.fair_max_views),
+        frame_selection="all",
         pose_metadata_root=None, pose_required=False,
         shared_view_normalization=False,
     )
@@ -290,6 +426,19 @@ def measure_tracking_icp(dataset, indices: list[int]) -> tuple[list[float], int,
     if not indices or not all(index < len(samples) and samples[index].get("view_records") for index in indices):
         return [], 0, "dataset has no raw-frame multi-view groups"
     pipeline_src = Path("/home/georg/workspace/minimal-tracking-pipeline/src")
+    if sys.version_info < (3, 10):
+        # The validation environment uses Python 3.8, whereas the tracking
+        # pipeline uses dataclass(slots=True), introduced in Python 3.10.
+        # Slots are not required by its aggregation path, so ignore only this
+        # unsupported decorator argument before importing that package.
+        import dataclasses
+        original_dataclass = dataclasses.dataclass
+        if not getattr(original_dataclass, "_icp_slots_compat", False):
+            def dataclass_compat(*args, **kwargs):
+                kwargs.pop("slots", None)
+                return original_dataclass(*args, **kwargs)
+            dataclass_compat._icp_slots_compat = True
+            dataclasses.dataclass = dataclass_compat
     if str(pipeline_src) not in sys.path:
         sys.path.insert(0, str(pipeline_src))
     try:
@@ -297,11 +446,18 @@ def measure_tracking_icp(dataset, indices: list[int]) -> tuple[list[float], int,
     except Exception as exc:
         return [], 0, f"tracking ICP import failed: {exc!r}"
     timings, failed = [], 0
+    last_error = None
     for index in indices:
         sample = samples[index]
         try:
             paths = [record["file"] for record in sample["view_records"]]
-            track, _ = _build_track(str(sample.get("group_id", sample["sample_id"])), paths, {})
+            track_sample_id = str(sample.get("group_id", sample["sample_id"]))
+            # Top-down unmatched tracks have no object suffix, while the
+            # aggregator parser requires one. The object ID is irrelevant to
+            # registration, so use a stable placeholder for live timing.
+            if "__object_" not in track_sample_id:
+                track_sample_id += "__object_0"
+            track, _ = _build_track(track_sample_id, paths, {})
             operation = lambda: _build_accumulator().accumulate(track, _lane_box())
             for _ in range(ARGS.tracking_icp_warmup):
                 operation()
@@ -309,9 +465,10 @@ def measure_tracking_icp(dataset, indices: list[int]) -> tuple[list[float], int,
                 started = time.perf_counter()
                 operation()
                 timings.append(time.perf_counter() - started)
-        except Exception:
+        except Exception as exc:
             failed += 1
-    return timings, failed, None
+            last_error = repr(exc)
+    return timings, failed, (f"tracking ICP failed: {last_error}" if last_error else None)
 
 
 def process_memory_peak_bytes() -> int:
@@ -757,27 +914,32 @@ def main() -> int:
                 "training_test": evaluate(model, train_test, cfg, device, run_out / "training_test"),
             }
             if is_icp_aggregate_baseline:
+                training_sources = build_icp_aggregate_source_dataset(
+                    cfg, Path(cfg.raw_frames_root))
+                results["training_test"]["tracking_icp_latency"] = (
+                    benchmark_icp_aggregate_sources(training_sources, train_test))
+                with (run_out / "training_test" / "metrics.json").open("w", encoding="utf-8") as f:
+                    json.dump(results["training_test"], f, indent=2, sort_keys=True)
+            if is_icp_aggregate_baseline:
                 # Config 13 was trained on ICP-aggregated clouds. Its top-down
-                # evaluation must use the matching aggregate exports, separated
-                # by whether GT and prior prediction agree.
-                aggregate_sets = build_icp_aggregate_top_down_datasets(
+                # evaluation uses all matching aggregate exports in one combined test set.
+                aggregate_dataset = build_icp_aggregate_top_down_dataset(
                     cfg, list(train_test.classes))
-                for bucket, dataset in aggregate_sets.items():
-                    result_key = "top_down_" + bucket.replace("-", "_")
-                    results[result_key] = evaluate(
-                        model, dataset, cfg, device, run_out / result_key,
-                        rotation_deg_z=ARGS.top_down_rotation_deg_z)
+                result_key = "top_down"
+                results[result_key] = evaluate(
+                    model, aggregate_dataset, cfg, device, run_out / result_key,
+                    rotation_deg_z=ARGS.top_down_rotation_deg_z)
+                aggregate_sources = build_icp_aggregate_source_dataset(cfg)
+                results[result_key]["tracking_icp_latency"] = benchmark_icp_aggregate_sources(
+                    aggregate_sources, aggregate_dataset)
+                with (run_out / result_key / "metrics.json").open("w", encoding="utf-8") as f:
+                    json.dump(results[result_key], f, indent=2, sort_keys=True)
             else:
                 assert top_down is not None
                 results["top_down"] = evaluate(
                     model, top_down, cfg, device, run_out / "top_down",
                     rotation_deg_z=ARGS.top_down_rotation_deg_z)
-            is_raw_single_view = (
-                ARGS.fair_single_view_eval
-                and str(cfg.get("classification_dataset_format", "")).lower() == "raw_frames"
-                and str(cfg.model.get("NAME", "")) == "BaseCls"
-                and not as_bool(cfg.get("raw_frames_object_multi_view", False))
-            )
+            is_raw_single_view = ARGS.fair_single_view_eval and is_raw_single_view_config(cfg)
             if is_raw_single_view:
                 fair_test, fair_top = build_fair_single_view_object_datasets(
                     cfg, list(train_test.classes))
